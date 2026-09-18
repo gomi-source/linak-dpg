@@ -246,11 +246,60 @@ request/response — is why it keeps a callback API while everything on
 DeskPanel does not.
 
 `Move` returns as soon as the first target has been written. A background
-goroutine then rewrites the target until the desk reports speed 0, gives
-up after 5 seconds of no movement, and accepts a new target mid-flight
-(calling `Move` again while moving retargets rather than starting a second
-move, with an 800 ms settle before the new target is written — writing it
-sooner makes the desk halt).
+goroutine then rewrites it until the desk arrives, and gives up after 5
+seconds without progress.
+
+**A halt is not an arrival, and it is not pushed through.** The desk
+reports speed 0 both when it has reached the target and when it has
+stopped short — and one reason it stops short is that it has hit
+something. Arrival is *speed 0 and within 2 mm of the target*. A halt
+anywhere else, once the desk has been moving, **ends the move**: the
+target is not written again. The controller's own safety stop is the only
+protection whatever it met has, and re-commanding would drive the desk
+back into it. The move logs where it stopped and how far short; whether to
+ask again belongs to the caller, who may know the way is clear.
+
+Before the desk has moved at all, the target is offered for a short grace
+period — it takes a moment to pick the first one up — and then given up on
+with a warning. That window is deliberately brief for the same reason.
+
+Calling `Move` again while moving retargets rather than starting a second
+move — but a retarget is a new move, not an assignment. **The desk only
+accepts a different height once it has come to rest.** Writing one sooner
+halts it instead of redirecting it.
+
+Rewriting the *same* height is what sustains movement, and stopping the
+writes is what stops the desk — so a retarget goes quiet, waits for the
+stream to report speed 0, and only then writes the new height. The silence
+is the braking. A reversal additionally sends `Stop`, bringing it to rest
+deliberately rather than by coasting.
+
+`RetargetGap` (800 ms) is the floor under that wait, not the wait itself:
+the retarget resumes once the desk is at rest *and* the gap has elapsed,
+whichever is later. The fixed figure came from trial before the speed
+stream was being watched, and keeping it means this is never quicker off
+the mark than what was known to work; waiting for rest is what covers a
+desk still decelerating after 800 ms, which a fixed pause could not. It is
+a package variable, so another controller can be given another figure.
+
+Anything the desk reports during that gap — including speed 0 — is the old
+move ending, not a fault. The halt in the middle of a retarget is ours;
+only a halt during travel is the desk's own.
+
+**A burst of targets costs one gap, not one each.** Targets arriving while
+the desk is quiet supersede the one that started the gap, so `1500, 1700,
+1900, 2100` sent in quick succession interrupts the desk once and then
+runs to 2100 — rather than pausing 800 ms per nudge. The direction check
+is made after the gap against the final target, so a burst that ends up
+pointing the other way is still stopped properly first.
+
+Position reports go into a one-slot holder, never a queue. They arrive on
+their own goroutine each, so a blocking handoff leaves a backlog of
+readings from seconds ago — and a speed 0 recorded *before* a retarget
+then surfaces *after* it and reads as the new move finishing. That is a
+real failure, not a theoretical one: a short first move that completes
+while the retarget is pending ends the whole sequence one write into the
+second move.
 
 ### `dpg/subscription` — notification plumbing
 

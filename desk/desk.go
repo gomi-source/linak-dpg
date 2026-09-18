@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gomi-source/linak-dpg"
@@ -26,8 +27,8 @@ type Desk struct {
 	deskPanelMu sync.Mutex
 	slots       *deskPanelSlots
 
-	chMove   chan int
-	isMoving bool
+	chMove chan int
+	moving atomic.Bool
 }
 
 // DefaultTimeout bounds how long a DeskPanel read waits for its answer
@@ -44,7 +45,7 @@ func New(device dpg.Device, name string) *Desk {
 		gatt:   &dpg.GATT{},
 		roSub:  referenceoutput.NewSubscription(device),
 		slots:  newDeskPanelSlots(),
-		chMove: make(chan int),
+		chMove: make(chan int, 1),
 		ID:     device.Address(), // Note: stable across reconnects on this Mac, but a different Mac sees a different ID for the same physical desk
 		Name:   name,
 	}
@@ -475,93 +476,4 @@ func (d *Desk) control(cmd dpg.ControlCommand) error {
 	}
 
 	return nil
-}
-
-// Move desk to height in 1/10mm from the base
-func (d *Desk) Move(mmx10 int) error {
-	if d.isMoving {
-		d.newTargetHeigh(mmx10)
-		return nil
-	}
-
-	d.isMoving = true
-
-	// Get ReferenceInput Characteristic
-	c, err := d.gatt.GetCharacteristic(d.device, dpg.ServiceUUIDReferenceInput, dpg.CharacteristicUUIDReferenceInput)
-	if err != nil {
-		return fmt.Errorf("could not move desk: %v", err)
-	}
-
-	// Pack height to the format expected by the GATT characteristic
-	bHeight := dpg.NewHeight(mmx10).Bytes() // height from base in mm * 10
-
-	// Start a subsciption to ReferenceOutput in order to signal when movement has stopped (speed = 0)
-	chMoving := make(chan bool)
-	firstEvent := true
-
-	removeCallback := d.roSub.AddReferenceOutputCallback(func(extension int, speed int) {
-		// Signal to stop if speed is 0 after first loop (somethimes the desk reports speed 0 as movement starts)
-		if firstEvent {
-			firstEvent = false
-			chMoving <- true
-		} else {
-			chMoving <- speed != 0
-		}
-	})
-
-	log := d.device.Logger()
-
-	// Set timeout to avoiud goroutine leak
-	timeout := time.After(5 * time.Second)
-
-	go func() {
-		defer func() { d.isMoving = false }()
-		defer removeCallback()
-
-		moveTarget := bHeight[:]
-		for {
-			_, err = c.WriteWithoutResponse(moveTarget)
-			if err != nil {
-				return
-			}
-
-			select {
-			case isMoving := <-chMoving:
-				if !isMoving {
-					log.Debug("move finished", "target_tenths_mm", mmx10)
-					return
-				}
-			case <-timeout:
-				// Nothing moved. Either the desk is already there, or it
-				// is ignoring us because the owner bit is not set.
-				log.Warn("move timed out with no movement reported",
-					"target_tenths_mm", mmx10,
-					"hint", "the desk ignores writes unless TakeOwnership has succeeded")
-				return
-			case mmx10 = <-d.chMove:
-				bHeight = dpg.NewHeight(mmx10).Bytes()
-				moveTarget = bHeight[:] // New target height used in next loop
-
-				time.Sleep(800 * time.Millisecond) // Desk halts if new target height written too soon
-				// TODO: Make sleep time configurable
-			}
-
-			// Reset timeout before next loop
-			// (timeout only needed when WriteWithoutResponse does not trigger movement and chMoving is never set)
-			timeout = time.After(5 * time.Second)
-		}
-	}()
-
-	return nil
-}
-
-func (d *Desk) newTargetHeigh(mmx10 int) {
-	// Non-blocking: replace previous request
-	select {
-	case d.chMove <- mmx10:
-	default:
-		// queue full → replace old request
-		<-d.chMove
-		d.chMove <- mmx10
-	}
 }
