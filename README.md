@@ -307,6 +307,14 @@ A characteristic's notifications, demultiplexed by message type.
 `AddCallback(msgType, fn)` returns a function that removes the callback;
 notifications are enabled lazily on the first registration.
 
+Registering and removing are safe from any goroutine, including from
+inside a handler. The callback map is only touched under the
+subscription's mutex, and the dispatch loop copies the handlers for a
+frame before calling them rather than ranging over the map while it does
+— which matters more than a data race would: writing a map that is being
+ranged over is a fatal runtime error, so the old unlocked version could
+take the process down rather than merely misbehave.
+
 A memory position has two possible replies, under two different response
 codes, so it needs two callbacks. One that holds a height answers with
 code 7, nine bytes — `01 07 01 <2B extension> <4B counter>` — and reaches
@@ -544,11 +552,6 @@ This is a prototype, and these are known:
 
 - **The notify registry cannot unsubscribe.** `notify.go` only appends.
   Everything above about reusing subscriptions follows from this.
-- **`subscription.Subscription.AddCallback` is not goroutine-safe.** It
-  mutates the callback map without holding the mutex that `start()` uses,
-  while the dispatch loop reads it. Registering callbacks from one
-  goroutine at setup avoids it; `desk.Move` adding and removing its own
-  callback from a background goroutine does not.
 - **The typed parsers' `len(data)` guards are what keep acknowledgements
   out.** The dispatch loop's two branches are additive, not exclusive: a
   frame goes to the callback registered for `data[1]`, and then, if it is

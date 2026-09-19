@@ -56,21 +56,74 @@ func (s *Subscription) AddWriteCallback(callback func([2]byte)) (RemoveCallback 
 	})
 }
 
-// Generic AddCallback function
+// AddCallback registers a handler for one message type and returns a
+// function that removes it again.
+//
+// It is safe to call from any goroutine, and safe to call from inside a
+// handler: the callback map is only ever touched under s.mu, and the
+// dispatch loop copies the handlers it is about to run rather than ranging
+// over the map while it calls them. Without that, adding a callback while
+// a notification was being dispatched was not merely a data race - a map
+// written during a range over it is a fatal runtime error, which would
+// have taken the process down rather than corrupting a reading.
+//
+// Removing a handler stops it being called. It does not stop the
+// subscription: once started, its dispatcher lives for as long as the
+// client does. See the note on that in the package README.
 func (s *Subscription) AddCallback(msgType MessageType, callback func([]byte)) func() {
-	if s.registeredCallbacks[byte(msgType)] == nil {
-		s.registeredCallbacks[byte(msgType)] = make(map[int]func([]byte))
+	key := byte(msgType)
+	id := s.register(key, callback)
+
+	// Deliberately outside the lock: start takes s.mu itself, and
+	// EnableNotifications reaches the BLE client, which should never be
+	// called while holding a lock the dispatch loop needs.
+	s.start()
+
+	return func() { s.unregister(key, id) }
+}
+
+// register stores a handler and returns the id that removes it.
+func (s *Subscription) register(key byte, callback func([]byte)) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.registeredCallbacks == nil {
+		s.registeredCallbacks = make(map[byte]map[int]func([]byte))
+	}
+	if s.registeredCallbacks[key] == nil {
+		s.registeredCallbacks[key] = make(map[int]func([]byte))
 	}
 
 	s.nextCallbackId++
 	id := s.nextCallbackId
-	s.registeredCallbacks[byte(msgType)][id] = callback
+	s.registeredCallbacks[key][id] = callback
+	return id
+}
 
-	s.start()
+// unregister drops a handler. Removing one twice, or removing from a
+// message type that has none, is a no-op.
+func (s *Subscription) unregister(key byte, id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.registeredCallbacks[key], id)
+}
 
-	return func() {
-		delete(s.registeredCallbacks[byte(msgType)], id)
+// handlersFor copies the handlers registered for a message type, so they
+// can be called without holding the lock - and so that one of them adding
+// or removing a callback cannot mutate the map being iterated.
+func (s *Subscription) handlersFor(key byte) []func([]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	registered := s.registeredCallbacks[key]
+	if len(registered) == 0 {
+		return nil
 	}
+	handlers := make([]func([]byte), 0, len(registered))
+	for _, h := range registered {
+		handlers = append(handlers, h)
+	}
+	return handlers
 }
 
 // Enable notifications on DeskPanel Characteristic and start dispatch loop
@@ -108,19 +161,14 @@ func (s *Subscription) start() error {
 				msgType = byte(MessageTypeReferenceOutput)
 			}
 
-			if callbacks, ok := s.registeredCallbacks[msgType]; ok {
-				for _, handler := range callbacks {
-					go handler(data)
-				}
+			for _, handler := range s.handlersFor(msgType) {
+				go handler(data)
 			}
 
 			// Write responses are common to all characteristics and always length 2
 			if len(data) == 2 {
-				msgType = byte(MessageTypeWriteResponse)
-				if callbacks, ok := s.registeredCallbacks[msgType]; ok {
-					for _, handler := range callbacks {
-						go handler(data)
-					}
+				for _, handler := range s.handlersFor(byte(MessageTypeWriteResponse)) {
+					go handler(data)
 				}
 			}
 		}
