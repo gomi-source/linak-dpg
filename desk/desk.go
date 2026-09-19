@@ -25,7 +25,13 @@ type Desk struct {
 	// answer it belongs to. deskPanelMu enforces the one-at-a-time part
 	// and slots hold the answers; see query.go for why both are needed.
 	deskPanelMu sync.Mutex
-	slots       *deskPanelSlots
+
+	// reminderMu holds a reminder read and its write together. The desk
+	// has no partial write, so changing one preset means rewriting all of
+	// them, and two callers doing that at once would lose one another's
+	// changes.
+	reminderMu sync.Mutex
+	slots      *deskPanelSlots
 
 	chMove chan int
 	moving atomic.Bool
@@ -192,11 +198,15 @@ func (d *Desk) requestReminder() error {
 	return nil
 }
 
-// WriteReminder stores reminder settings on the desk: which preset is
-// active, or that reminders are off, and the sitting/standing intervals of
-// all three presets. One write carries all of it, so read the current
-// settings first and change only what you mean to - passing a zero
-// Reminder clears every preset.
+// WriteReminder replaces every reminder setting on the desk at once: which
+// preset is active, or that reminders are off, and the intervals of all
+// three presets. One write carries all of it - the controller offers no
+// way to change part - so a zero Reminder clears the lot.
+//
+// Most callers want WriteReminderPreset or WriteActiveReminder instead,
+// which read the current settings and change only the part named. This is
+// for a caller that already holds a whole Reminder and means to write all
+// of it.
 //
 // Like every write, it is silently ignored unless TakeOwnership has succeeded.
 //
@@ -224,6 +234,84 @@ func (d *Desk) WriteReminder(r dpg.Reminder) error {
 		return fmt.Errorf("error when writing reminder settings: %v", err)
 	}
 
+	return nil
+}
+
+// WriteReminderPreset changes one preset's intervals, 1 to 3, leaving the
+// other two and the active selection as they are.
+//
+// The controller has no partial write - one write carries every setting -
+// so this reads the current settings, alters the preset named, and writes
+// the result back. That is a quirk of the hardware rather than something a
+// caller should have to work around, which is why this exists.
+//
+// Note that changing the active preset's intervals takes effect
+// immediately; changing another preset's does not, until it is selected.
+func (d *Desk) WriteReminderPreset(ctx context.Context, preset int, intervals dpg.ReminderIntervals) error {
+	if preset < 1 || preset > 3 {
+		return fmt.Errorf("could not write reminder preset: %d is not between 1 and 3", preset)
+	}
+
+	return d.updateReminder(ctx, fmt.Sprintf("preset %d", preset), func(r *dpg.Reminder) {
+		applyPreset(r, preset, intervals)
+	})
+}
+
+// applyPreset sets one preset's intervals and touches nothing else. Split
+// out so the "only that preset changes" rule can be tested without a desk.
+func applyPreset(r *dpg.Reminder, preset int, intervals dpg.ReminderIntervals) {
+	switch preset {
+	case 1:
+		r.Option1 = intervals
+	case 2:
+		r.Option2 = intervals
+	case 3:
+		r.Option3 = intervals
+	}
+}
+
+// WriteActiveReminder selects which preset the desk reminds on, or turns
+// reminders off with dpg.ReminderOff, leaving all three presets' intervals
+// as they are.
+//
+// Like WriteReminderPreset, this reads before writing because the
+// controller has no partial write.
+func (d *Desk) WriteActiveReminder(ctx context.Context, option dpg.ReminderOption) error {
+	switch option {
+	case dpg.ReminderOff, dpg.ReminderOption1, dpg.ReminderOption2, dpg.ReminderOption3:
+	default:
+		return fmt.Errorf("could not write active reminder: %d is not a reminder option the desk knows", option)
+	}
+
+	return d.updateReminder(ctx, "active option", func(r *dpg.Reminder) {
+		r.ActiveOption = option
+	})
+}
+
+// updateReminder is the read-modify-write the controller forces on anyone
+// changing part of the reminder settings.
+//
+// reminderMu holds the pair together. Without it two callers changing
+// different presets could both read the old settings and the second write
+// would quietly undo the first - the classic lost update, and an easy one
+// to hit here because a whole write is the only kind there is.
+func (d *Desk) updateReminder(ctx context.Context, what string, change func(*dpg.Reminder)) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	d.reminderMu.Lock()
+	defer d.reminderMu.Unlock()
+
+	current, err := d.Reminder(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read reminder settings before changing %s: %w", what, err)
+	}
+
+	change(&current)
+
+	if err := d.WriteReminder(current); err != nil {
+		return fmt.Errorf("could not write %s: %w", what, err)
+	}
 	return nil
 }
 

@@ -204,7 +204,8 @@ command known not to does not.
 | `BaseOffset(ctx)` / `WriteBaseOffset(mmx10)` | The stored floor offset |
 | `User(ctx)` / `WriteUser(u)` / `TakeOwnership(ctx)` | The stored user ID and its owner bit |
 | `MemoryPosition(ctx, n)` / `WriteMemoryPosition(m)` / `UnsetMemoryPosition(n)` | The panel's 1–4 memory buttons |
-| `Reminder(ctx)` / `WriteReminder(r)` | The stand/sit reminder presets; one write carries all three |
+| `Reminder(ctx)` / `WriteReminderPreset(ctx, n, intervals)` / `WriteActiveReminder(ctx, option)` | The stand/sit reminder presets |
+| `WriteReminder(r)` | Replace every reminder setting at once; see below |
 | `Capabilities(ctx)` / `ProductInfo(ctx)` | What the controller is and supports |
 | `Positions()` | The ReferenceOutput stream |
 | `DeskPanelSubscription()` | Escape hatch; see below |
@@ -573,10 +574,13 @@ This is a prototype, and these are known:
   `AddProductInfoCallback`. Neither length occurs in the protocol as
   observed, so that only matters if another controller answers
   differently.
-- **`WriteReminder` rewrites every preset at once.** One write carries the
-  active option *and* all three presets, so there is no way to change one
-  alone: read the current settings, change what you mean to, write the
-  whole thing back. A zero `Reminder` clears the lot.
+- **The controller has no partial write for reminders.** One write carries
+  the active option *and* all three presets. `WriteReminderPreset` and
+  `WriteActiveReminder` hide that — they read, change the named part, and
+  write the whole thing back, under a mutex so two callers changing
+  different presets cannot lose one another's changes. `WriteReminder`
+  remains for a caller that already holds a whole `Reminder` and means to
+  replace everything; a zero one clears the lot.
 - **`Desk.ID` is the peripheral ID**, not the name passed to `New` — which
   is stored in `Desk.Name`.
 - **An unset memory position cannot be told from another unset one.**
