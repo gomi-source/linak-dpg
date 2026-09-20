@@ -262,17 +262,28 @@ protection whatever it met has, and re-commanding would drive the desk
 back into it. The move logs where it stopped and how far short; whether to
 ask again belongs to the caller, who may know the way is clear.
 
-Before the desk has moved at all, the target is offered for a short grace
-period — it takes a moment to pick the first one up — and then given up on
-with a warning. That window is deliberately brief for the same reason.
+Before the desk has moved at all, the target is offered every 200 ms for
+1.5 s, and then given up on with a warning. That is the one place a
+command is repeated at a desk that is not moving, and it is bounded for
+the reason above.
+
+**Nothing acknowledges a write.** ReferenceInput is
+write-without-response, so a target that never reached the controller
+looks exactly like one it chose to ignore. Once the desk is moving this
+costs nothing — its reports drive the loop and the next one re-sends the
+target anyway — but from rest there are no reports, so a single write that
+went missing would end the move in silence. The retry above is for the
+link, not for the desk's decision: it stops the instant the desk has
+moved, after which a halt is the desk's own and is never re-commanded.
 
 **The desk reports only while it moves.** A stationary one says nothing
 at all — no position, no speed 0, nothing. So silence is the normal state
 between moves, and it is also how a move that never started announces
-itself: there is no reading to classify, and the move ends at the stall
-timeout rather than at a speed 0 reading. The warning carries the last
-height the desk reported, which may be from an earlier move, and the
-distance from it.
+itself: there is no reading to classify, so the move ends when the start
+window above closes rather than at a speed 0 reading. The warning carries
+the last height the desk reported, which may be from an earlier move, and
+the distance from it. The five-second stall timeout is left for the other
+case — reports that stop mid-move, which means the link went away.
 
 **A move to where the desk already is returns immediately.** The `Desk`
 follows the height continuously once the first move has run — the recorder
@@ -304,24 +315,21 @@ stream to report speed 0, and only then writes the new height. The silence
 is the braking. A reversal additionally sends `Stop`, bringing it to rest
 deliberately rather than by coasting.
 
-**The gap applies between moves too, and rest is not enough on its own.**
-A `Move` that follows another closely is the same mistake as a retarget
-that does. Observed on a DPG1M: a move that had reported `speed 0` and
-arrived at `48.913` was followed by a different height written at
-`49.226`, and the desk ignored it — no movement, no reports. Coming to a
-stop does not by itself make the controller ready.
+Two hypotheses for the intermittent failures were tried on a DPG1M and
+both are dead, which is worth recording so they are not tried again. Moves
+that go nowhere are *not* explained by how soon they follow the previous
+one: a new height ignored 313 ms after the last write was ignored just as
+thoroughly at a full 800 ms, and two retargets with timings matching to
+within 2 ms went opposite ways. Nor are they explained by the controller
+disarming at rest: sending a wake-up before each move did not stop them,
+and repeating an ignored move gets it performed without one. Nothing
+deterministic in the protocol fits — a lost write does, which is what the
+retry above is for.
 
-So the time of the last height written is remembered on the `Desk`, across
-moves, and a new one waits out the remainder of the gap before its first
-write. `Move` still returns immediately; the waiting happens in its
-goroutine.
-
-That observation bounds the real figure rather than fixing it: **above
-313 ms, and 800 ms is known to work.** It also cannot say whether the gap
-runs from the last write or from the arrival 57 ms later — it is taken
-from the write, as the conservative reading. Lowering `RetargetGap` is how
-to narrow it, and the failure is harmless: the desk does not move and the
-move times out saying so.
+The time of the last height written is remembered on the `Desk` across
+moves, and `RetargetGap` applies to it — but only for its original
+purpose, a desk that is still travelling. It is not what makes a fresh
+move work.
 
 `RetargetGap` (800 ms) is the floor under that wait, not the wait itself:
 the retarget resumes once the desk is at rest *and* the gap has elapsed,

@@ -9,10 +9,10 @@ import (
 
 // Moving a DPG desk is not one write. The controller moves only while it
 // is being told where to go, so the target is rewritten continuously until
-// the desk reports it has arrived, and Move returns as soon as the first
-// write is out with a goroutine doing the rest.
+// the desk reports it has arrived. Move itself starts a goroutine and
+// returns; every write happens there.
 //
-// Three things make that harder than it sounds.
+// Four things make that harder than it sounds.
 //
 // The desk only accepts a different height once it has come to rest.
 // Rewriting the same height is what sustains movement; stop writing and it
@@ -36,6 +36,17 @@ import (
 // all, so "no reports" is the normal state between moves and the way a
 // move that never started announces itself - there is no speed 0 reading
 // to classify, because there is no reading.
+//
+// Nothing acknowledges a write. ReferenceInput is write-without-response,
+// so a target that never reaches the controller looks exactly like one it
+// chose to ignore. Once the desk is moving this costs nothing: its reports
+// drive the loop, and the next one re-sends the target anyway. From rest
+// there are no reports, so a single write that goes missing would end the
+// move in silence. That is why the target is offered on a timer until the
+// desk either starts moving or the start window runs out - the retry is
+// for the link, not for the desk's decision, and it stops the moment the
+// desk has moved. After that a halt is the desk's own and is never
+// re-commanded.
 //
 // Position reports must never be allowed to queue. They arrive on their
 // own goroutine each, so a blocking handoff would leave a backlog of
@@ -66,12 +77,23 @@ const (
 	// link and a desk that never had the owner bit look the same here.
 	stallTimeout = 5 * time.Second
 
-	// startGrace is how long the target keeps being written to a desk that
-	// has not begun moving. It is deliberately short: a desk that will not
-	// start is either deaf to us or blocked, and repeating the command at
-	// something that is not moving is the case worth being careful about.
-	// Once the desk has moved, a later halt is never re-commanded at all.
+	// startGrace is how long the target keeps being offered to a desk that
+	// has not begun moving, measured from the first write of that target.
+	// Reaching it ends the move: a desk that has not moved by now is not
+	// going to.
+	//
+	// It is deliberately short. The retry exists because an unacknowledged
+	// write can go missing and a stationary desk reports nothing to notice
+	// it by, not because a desk that has declined to move should be talked
+	// into it - so it covers a few lost writes and no more. Once the desk
+	// has moved, a later halt is never re-commanded at all.
 	startGrace = 1500 * time.Millisecond
+
+	// startRetryInterval is how often the target is re-offered within
+	// startGrace. Roughly the rate at which the desk's own reports would
+	// drive the writes once it is moving, which is the cadence the
+	// controller is built around.
+	startRetryInterval = 200 * time.Millisecond
 
 	// progressThreshold is how much the height has to change to count as
 	// progress and restart the stall timer, in tenths of a millimetre.
@@ -84,19 +106,14 @@ const (
 )
 
 // RetargetGap is the minimum quiet period between the last write of one
-// height and the first write of the next. A retarget waits for the desk to
-// report speed 0 *and* for this to elapse, whichever is later.
+// height and the first write of the next, for a retarget: the controller
+// halts rather than redirects when a different height arrives while it is
+// travelling, so it is left alone until it has stopped.
 //
-// Rest is necessary but not sufficient. A DPG1M that had reported speed 0
-// and arrived still ignored a different height written 313ms later, so
-// coming to a stop does not by itself make the controller ready. What the
-// gap is measured from - the last write, or the arrival 57ms after it -
-// that observation cannot separate; it is taken from the last write, which
-// is the conservative reading.
-//
-// So the true figure is somewhere above 313ms, and 800ms is known to work.
-// Lowering this is the way to find it: the failure is visible and harmless
-// - the desk does not move and the move times out saying so.
+// It is not what makes a *new* move work. A DPG1M ignored a new height
+// written 800ms after the previous move finished just as thoroughly as one
+// written 313ms after, and moved for the same height moments later - so
+// the gap is about a desk still travelling, and nothing else.
 //
 // It is a package variable so a different controller can be given a
 // different figure; nothing reads it after a move has begun, so change it
@@ -113,8 +130,10 @@ type reading struct {
 // Move sends the desk to an extension, in tenths of a millimetre above its
 // own base - not above the floor; see BaseOffset for the other frame.
 //
-// It returns as soon as the first target has been written; a background
-// goroutine keeps the target in front of the desk while it travels.
+// It returns as soon as the move is under way rather than when it
+// finishes: a background goroutine writes the target, offers it again if
+// the desk has not started, and keeps it in front of the desk while it
+// travels. Errors after that are logged, not returned.
 //
 // Calling Move again while a move is running retargets that move rather
 // than starting a second one. A reversal stops the desk first and waits
@@ -188,10 +207,17 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 	var last reading
 	haveLast := false
 	movedYet := false
-	written := time.Now()
+	written := time.Now()      // the last write of any height
+	offeredSince := time.Now() // the first write of the current one
 
 	stall := time.NewTimer(stallTimeout)
 	defer stall.Stop()
+
+	// The target is offered on this tick until the desk starts moving; see
+	// startGrace. It keeps running afterwards and is ignored, which is
+	// cheaper than stopping and restarting it around every retarget.
+	offer := time.NewTicker(startRetryInterval)
+	defer offer.Stop()
 
 	write := func() bool {
 		if _, err := c.WriteWithoutResponse(target(mmx10)); err != nil {
@@ -203,18 +229,50 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 		return true
 	}
 
+	// start writes the first target of a move or a retarget, and restarts
+	// the window during which a desk that has not moved is offered it
+	// again.
+	start := func() bool {
+		offeredSince = time.Now()
+		movedYet = false
+		if !write() {
+			return false
+		}
+		resetTimer(stall, stallTimeout)
+		return true
+	}
+
+	// noStart ends a move the desk never began. Two things stop one
+	// starting and the distance tells them apart, so it is logged rather
+	// than left to be subtracted: a target inside the controller's dead
+	// band is simply ignored, which is much the commoner of the two now
+	// that ownership is asserted on connect.
+	noStart := func() {
+		args := []any{"target_tenths_mm", mmx10}
+		at, ok := d.lastKnownPosition()
+		if haveLast {
+			at, ok = last.extension, true
+		}
+		if ok {
+			args = append(args, "at_tenths_mm", at, "distance_tenths_mm", abs(mmx10-at))
+		}
+		args = append(args, "hint", "a short distance means the target is inside the desk's dead band and it will not move; otherwise the desk is blocked, or writes are being ignored because TakeOwnership has not succeeded")
+		log.Warn("desk did not start moving", args...)
+	}
+
 	// A move that follows another too closely is the same mistake as a
-	// retarget that does: the controller ignores a different height until
-	// it has been left alone. Between two Move calls nothing else enforces
-	// that, so it is enforced here, before the first write.
+	// retarget that does: the controller halts rather than redirects. The
+	// previous move may have been this Desk's or somebody else's on the same
+	// connection, so the last write time is kept across moves rather than
+	// per move.
 	if wait := d.waitBeforeTarget(mmx10); wait > 0 {
 		log.Debug("waiting before a new target", "target_tenths_mm", mmx10, "wait", wait.Round(time.Millisecond))
 		time.Sleep(wait)
 	}
-	if !write() {
+
+	if !start() {
 		return
 	}
-	resetTimer(stall, stallTimeout)
 
 	for {
 		select {
@@ -249,25 +307,14 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 					"short_by_tenths_mm", abs(mmx10-r.extension),
 					"hint", "the desk stops by itself when it meets resistance")
 
-			case time.Since(written) < startGrace:
+			case time.Since(offeredSince) < startGrace:
 				// Not started yet. A desk takes a moment to pick up the
-				// first target, so keep offering it - briefly.
-				if !write() {
-					return
-				}
+				// first target; the offer tick keeps putting it in front of
+				// it, so there is nothing to do but wait.
 				continue
 
 			default:
-				// Two things stop a desk starting, and the distance tells
-				// them apart: a target within the controller's own dead
-				// band is simply ignored, which is the common one now that
-				// ownership is asserted on every connect. The distance is
-				// logged so the reader does not have to subtract.
-				log.Warn("desk did not start moving",
-					"target_tenths_mm", mmx10,
-					"at_tenths_mm", r.extension,
-					"distance_tenths_mm", abs(mmx10-r.extension),
-					"hint", "a short distance means the target is inside the desk's dead band and it will not move; otherwise the desk ignores writes unless TakeOwnership has succeeded, or it is blocked")
+				noStart()
 			}
 			return
 
@@ -307,11 +354,9 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			// again - but it is the same move, not a new one.
 			if sameDestination(newTarget, mmx10) {
 				log.Debug("move resuming after a repeat", "target_tenths_mm", mmx10)
-				movedYet = false
-				if !write() {
+				if !start() {
 					return
 				}
-				resetTimer(stall, stallTimeout)
 				continue
 			}
 
@@ -328,21 +373,36 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			}
 
 			mmx10 = newTarget
-			movedYet = false // the desk has to start again from rest
+			if !start() { // the desk has to start again from rest
+				return
+			}
+
+		case <-offer.C:
+			// Before the desk has moved, a write that went missing is
+			// indistinguishable from one it ignored, and nothing will
+			// report either. Offer the target again - but only until the
+			// window closes, and never once it has moved.
+			if movedYet {
+				continue
+			}
+			if time.Since(offeredSince) >= startGrace {
+				noStart()
+				return
+			}
 			if !write() {
 				return
 			}
-			resetTimer(stall, stallTimeout)
 
 		case <-stall.C:
-			// The desk reports only while it moves, so silence here means
-			// it never started - this is where a move that goes nowhere
-			// ends up, not the speed 0 branch above.
-			args := []any{"target_tenths_mm", mmx10}
+			// A move that never started is ended by the offer tick long
+			// before this, so reaching it means the reports dried up
+			// mid-move: the link is gone, or the desk stopped without
+			// saying so. Either way there is nothing left to sustain.
+			args := []any{"target_tenths_mm", mmx10, "moved", movedYet}
 			if at, ok := d.lastKnownPosition(); ok {
 				args = append(args, "last_known_tenths_mm", at, "distance_tenths_mm", abs(mmx10-at))
 			}
-			args = append(args, "hint", "the desk reports nothing when stationary, so it never moved: either the target is inside its dead band - compare the distance - or writes are being ignored because TakeOwnership has not succeeded")
+			args = append(args, "hint", "the desk reports while it moves and goes quiet when it stops, so reports ending without a speed 0 usually means the connection dropped")
 			log.Warn("move timed out with no position reports", args...)
 			return
 		}
