@@ -32,6 +32,11 @@ import (
 // old code's "keep writing until something moves" is exactly what must not
 // happen once the desk has decided to stop.
 //
+// The desk reports only while it moves. A stationary one says nothing at
+// all, so "no reports" is the normal state between moves and the way a
+// move that never started announces itself - there is no speed 0 reading
+// to classify, because there is no reading.
+//
 // Position reports must never be allowed to queue. They arrive on their
 // own goroutine each, so a blocking handoff would leave a backlog of
 // readings from seconds ago, and a speed 0 recorded before a retarget
@@ -69,8 +74,7 @@ const (
 	startGrace = 1500 * time.Millisecond
 
 	// progressThreshold is how much the height has to change to count as
-	// progress and restart the stall timer, in tenths of a millimetre. A
-	// stationary desk still reports, and its readings jitter slightly.
+	// progress and restart the stall timer, in tenths of a millimetre.
 	progressThreshold = 5
 
 	// stopSettle bounds the wait for the desk to come to rest after a
@@ -83,13 +87,16 @@ const (
 // height and the first write of the next. A retarget waits for the desk to
 // report speed 0 *and* for this to elapse, whichever is later.
 //
-// The speed reading is the real condition - the desk accepts a new height
-// only once it has stopped - and this is the floor under it: 800ms was
-// arrived at by trial against a DPG1M, before the stream was being watched
-// for rest, and keeping it means the new behaviour is never quicker off
-// the mark than what was known to work. Waiting for rest as well is what
-// covers a desk still decelerating after 800ms, which a fixed pause could
-// not.
+// Rest is necessary but not sufficient. A DPG1M that had reported speed 0
+// and arrived still ignored a different height written 313ms later, so
+// coming to a stop does not by itself make the controller ready. What the
+// gap is measured from - the last write, or the arrival 57ms after it -
+// that observation cannot separate; it is taken from the last write, which
+// is the conservative reading.
+//
+// So the true figure is somewhere above 313ms, and 800ms is known to work.
+// Lowering this is the way to find it: the failure is visible and harmless
+// - the desk does not move and the move times out saying so.
 //
 // It is a package variable so a different controller can be given a
 // different figure; nothing reads it after a move has begun, so change it
@@ -133,6 +140,18 @@ func (d *Desk) Move(mmx10 int) error {
 		d.newTargetHeigh(mmx10)
 		return nil
 	}
+
+	d.ensurePositionTracking()
+
+	// A target the desk is already at is a no-op, and it is one we can
+	// recognise: asking anyway means five seconds of silence and a warning
+	// for a move that was never going to happen.
+	if at, ok := d.lastKnownPosition(); ok && sameDestination(mmx10, at) {
+		d.device.Logger().Debug("move not needed, desk is already there",
+			"target_tenths_mm", mmx10, "at_tenths_mm", at)
+		return nil
+	}
+
 	d.moving.Store(true)
 
 	c, err := d.gatt.GetCharacteristic(d.device, dpg.ServiceUUIDReferenceInput, dpg.CharacteristicUUIDReferenceInput)
@@ -148,12 +167,9 @@ func (d *Desk) Move(mmx10 int) error {
 		readings.put(reading{extension: extension, speed: speed})
 	})
 
-	if _, err := c.WriteWithoutResponse(target(mmx10)); err != nil {
-		removeCallback()
-		d.moving.Store(false)
-		return fmt.Errorf("could not move desk: %v", err)
-	}
-
+	// The first write happens in the goroutine, not here: the controller
+	// may need to be left alone for the rest of RetargetGap before it will
+	// accept this height, and Move must not block for that.
 	go func() {
 		defer d.moving.Store(false)
 		defer removeCallback()
@@ -183,8 +199,22 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			return false
 		}
 		written = time.Now()
+		d.noteTargetWritten(mmx10)
 		return true
 	}
+
+	// A move that follows another too closely is the same mistake as a
+	// retarget that does: the controller ignores a different height until
+	// it has been left alone. Between two Move calls nothing else enforces
+	// that, so it is enforced here, before the first write.
+	if wait := d.waitBeforeTarget(mmx10); wait > 0 {
+		log.Debug("waiting before a new target", "target_tenths_mm", mmx10, "wait", wait.Round(time.Millisecond))
+		time.Sleep(wait)
+	}
+	if !write() {
+		return
+	}
+	resetTimer(stall, stallTimeout)
 
 	for {
 		select {
@@ -305,12 +335,15 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			resetTimer(stall, stallTimeout)
 
 		case <-stall.C:
-			// Silence, not stillness: a desk reporting speed 0 is handled
-			// above. Either the link is gone or the desk never accepted
-			// the subscription.
-			log.Warn("move timed out with no position reports",
-				"target_tenths_mm", mmx10,
-				"hint", "the desk has stopped reporting; the link may be gone, or the desk ignores writes unless TakeOwnership has succeeded")
+			// The desk reports only while it moves, so silence here means
+			// it never started - this is where a move that goes nowhere
+			// ends up, not the speed 0 branch above.
+			args := []any{"target_tenths_mm", mmx10}
+			if at, ok := d.lastKnownPosition(); ok {
+				args = append(args, "last_known_tenths_mm", at, "distance_tenths_mm", abs(mmx10-at))
+			}
+			args = append(args, "hint", "the desk reports nothing when stationary, so it never moved: either the target is inside its dead band - compare the distance - or writes are being ignored because TakeOwnership has not succeeded")
+			log.Warn("move timed out with no position reports", args...)
 			return
 		}
 	}
@@ -380,6 +413,63 @@ func waitReadyForNewTarget(readings *slot[reading], last reading, haveLast bool,
 			return last, haveLast
 		}
 	}
+}
+
+// noteTargetWritten records a height written to ReferenceInput, so the
+// next move knows how long ago a different one went out.
+func (d *Desk) noteTargetWritten(mmx10 int) {
+	d.targetMu.Lock()
+	defer d.targetMu.Unlock()
+	d.lastTarget, d.haveTarget, d.lastTargetAt = mmx10, true, time.Now()
+}
+
+// waitBeforeTarget is how long to leave the controller alone before
+// writing this height. Rewriting the same one is what sustains a move and
+// needs no wait; a different one is refused until RetargetGap has passed
+// since the last write, whether that was this move or the one before.
+func (d *Desk) waitBeforeTarget(mmx10 int) time.Duration {
+	d.targetMu.Lock()
+	defer d.targetMu.Unlock()
+
+	if !d.haveTarget || sameDestination(mmx10, d.lastTarget) {
+		return 0
+	}
+	if wait := RetargetGap - time.Since(d.lastTargetAt); wait > 0 {
+		return wait
+	}
+	return 0
+}
+
+// lastKnownPosition is where the desk last reported itself, which may be
+// from an earlier move: it says nothing while stationary, so there is no
+// fresher answer to be had without moving it.
+func (d *Desk) lastKnownPosition() (int, bool) {
+	d.targetMu.Lock()
+	defer d.targetMu.Unlock()
+	return d.lastPosition, d.havePosition
+}
+
+// notePosition records a reported height for lastKnownPosition.
+func (d *Desk) notePosition(extension int) {
+	d.targetMu.Lock()
+	defer d.targetMu.Unlock()
+	d.lastPosition, d.havePosition = extension, true
+}
+
+// ensurePositionTracking starts following the desk's height, once. The
+// recorder is deliberately never removed: the desk reports only while it
+// moves, so the only way to know where it is between moves is to have
+// been listening during the last one - including one somebody made from
+// the panel.
+func (d *Desk) ensurePositionTracking() {
+	if d.roSub == nil {
+		return
+	}
+	d.trackPosition.Do(func() {
+		d.roSub.AddReferenceOutputCallback(func(extension, _ int) {
+			d.notePosition(extension)
+		})
+	})
 }
 
 // sameDestination reports whether two targets ask for the same place. The

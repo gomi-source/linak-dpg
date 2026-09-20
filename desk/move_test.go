@@ -266,3 +266,70 @@ func TestSameDestination(t *testing.T) {
 		})
 	}
 }
+
+// The controller refuses a different height until it has been left alone,
+// and that is as true between two Move calls as within one. A move that
+// finishes and is immediately followed by another wrote the new height
+// ~370ms after the old one on a DPG1M, and the desk ignored it entirely -
+// no movement, and no reports, because it reports only while moving.
+func TestWaitBeforeTargetSpansMoves(t *testing.T) {
+	d := &Desk{}
+
+	// Nothing written yet: nothing to wait for.
+	if wait := d.waitBeforeTarget(4586); wait != 0 {
+		t.Errorf("first target waits %v, want none", wait)
+	}
+
+	d.noteTargetWritten(4586)
+
+	// The same height again sustains the move and never waits.
+	if wait := d.waitBeforeTarget(4586); wait != 0 {
+		t.Errorf("repeating a height waits %v, want none", wait)
+	}
+	if wait := d.waitBeforeTarget(4586 + arrivalTolerance); wait != 0 {
+		t.Errorf("a height inside the dead band waits %v, want none", wait)
+	}
+
+	// A different one, straight after, waits out what is left of the gap.
+	wait := d.waitBeforeTarget(4718)
+	if wait <= 0 || wait > RetargetGap {
+		t.Errorf("a new height waits %v, want something up to %v", wait, RetargetGap)
+	}
+}
+
+func TestWaitBeforeTargetExpires(t *testing.T) {
+	d := &Desk{}
+	d.noteTargetWritten(4586)
+
+	d.targetMu.Lock()
+	d.lastTargetAt = time.Now().Add(-2 * RetargetGap)
+	d.targetMu.Unlock()
+
+	if wait := d.waitBeforeTarget(4718); wait != 0 {
+		t.Errorf("waits %v long after the last write, want none", wait)
+	}
+}
+
+// A target the desk is already at is a no-op we can recognise, rather
+// than five seconds of silence and a warning. The desk reports only while
+// it moves, so the position comes from the last time it did.
+func TestLastKnownPositionRecognisesANoOp(t *testing.T) {
+	d := &Desk{}
+
+	if _, ok := d.lastKnownPosition(); ok {
+		t.Error("reported a position before the desk ever did")
+	}
+
+	d.notePosition(4586)
+	at, ok := d.lastKnownPosition()
+	if !ok || at != 4586 {
+		t.Fatalf("last known position = %d/%v, want 4586", at, ok)
+	}
+
+	if !sameDestination(4586, at) {
+		t.Error("the height the desk is at was not recognised as a no-op")
+	}
+	if sameDestination(4718, at) {
+		t.Error("a real move was mistaken for a no-op")
+	}
+}

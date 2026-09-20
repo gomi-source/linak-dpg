@@ -26,6 +26,28 @@ type Desk struct {
 	// and slots hold the answers; see query.go for why both are needed.
 	deskPanelMu sync.Mutex
 
+	// lastTarget remembers the height last written to ReferenceInput and
+	// when, across Move calls. The controller will not accept a different
+	// height until it has been left alone for RetargetGap, and that is as
+	// true between two moves as it is within one - so this outlives the
+	// goroutine that wrote it.
+	targetMu     sync.Mutex
+	lastTarget   int
+	haveTarget   bool
+	lastTargetAt time.Time
+
+	// lastPosition is the most recent height the desk reported. It goes
+	// stale the moment a move ends, because a stationary desk reports
+	// nothing - it is for diagnostics, not for decisions.
+	lastPosition int
+	havePosition bool
+
+	// trackPosition registers the position recorder once. It is never
+	// removed - the notify registry cannot drop a dispatcher anyway - so
+	// after the first move the desk's position is followed continuously,
+	// including while somebody moves it from its own panel.
+	trackPosition sync.Once
+
 	// reminderMu holds a reminder read and its write together. The desk
 	// has no partial write, so changing one preset means rewriting all of
 	// them, and two callers doing that at once would lose one another's

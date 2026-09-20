@@ -266,11 +266,26 @@ Before the desk has moved at all, the target is offered for a short grace
 period — it takes a moment to pick the first one up — and then given up on
 with a warning. That window is deliberately brief for the same reason.
 
-**The usual reason a move never starts is that it had nowhere to go.** The
-controller will not act on a target inside its dead band, so `desk did not
-start moving` logs the distance alongside the target: a small one means
-the move was a no-op, not a failure. Ownership is the other explanation,
-and the less likely one wherever `TakeOwnership` runs on each connect.
+**The desk reports only while it moves.** A stationary one says nothing
+at all — no position, no speed 0, nothing. So silence is the normal state
+between moves, and it is also how a move that never started announces
+itself: there is no reading to classify, and the move ends at the stall
+timeout rather than at a speed 0 reading. The warning carries the last
+height the desk reported, which may be from an earlier move, and the
+distance from it.
+
+**A move to where the desk already is returns immediately.** The `Desk`
+follows the height continuously once the first move has run — the recorder
+is registered once and never removed, so it also sees a move made from the
+panel — and a target within the dead band of the last known position is
+recognised as a no-op rather than written and waited on. Without that it
+costs five seconds of silence and a warning for a move that was never
+going to happen.
+
+When a move does time out, the remaining explanations are the dead band
+(with an unknown position, so compare the logged distance) and ownership.
+"A height was written too recently" is not among them: the gap above makes
+that state unreachable.
 
 `arrivalTolerance` is that dead band, and it answers both questions
 because they are the same fact: a target this close is a no-op, and a desk
@@ -288,6 +303,25 @@ writes is what stops the desk — so a retarget goes quiet, waits for the
 stream to report speed 0, and only then writes the new height. The silence
 is the braking. A reversal additionally sends `Stop`, bringing it to rest
 deliberately rather than by coasting.
+
+**The gap applies between moves too, and rest is not enough on its own.**
+A `Move` that follows another closely is the same mistake as a retarget
+that does. Observed on a DPG1M: a move that had reported `speed 0` and
+arrived at `48.913` was followed by a different height written at
+`49.226`, and the desk ignored it — no movement, no reports. Coming to a
+stop does not by itself make the controller ready.
+
+So the time of the last height written is remembered on the `Desk`, across
+moves, and a new one waits out the remainder of the gap before its first
+write. `Move` still returns immediately; the waiting happens in its
+goroutine.
+
+That observation bounds the real figure rather than fixing it: **above
+313 ms, and 800 ms is known to work.** It also cannot say whether the gap
+runs from the last write or from the arrival 57 ms later — it is taken
+from the write, as the conservative reading. Lowering `RetargetGap` is how
+to narrow it, and the failure is harmless: the desk does not move and the
+move times out saying so.
 
 `RetargetGap` (800 ms) is the floor under that wait, not the wait itself:
 the retarget resumes once the desk is at rest *and* the gap has elapsed,
