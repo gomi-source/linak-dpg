@@ -51,6 +51,12 @@ func TestArrivalNeedsPositionNotJustSpeed(t *testing.T) {
 	if !arrived(reading{extension: target + arrivalTolerance, speed: 0}) {
 		t.Error("stopped within tolerance did not count as arrival")
 	}
+	// The tolerance is the dead band, so anything past it is a move the
+	// desk would actually perform. Reporting arrival there would end the
+	// move before it started.
+	if arrived(reading{extension: target + arrivalTolerance + 1, speed: 0}) {
+		t.Error("a distance the desk would move for counted as arrival")
+	}
 	if arrived(reading{extension: target, speed: 12}) {
 		t.Error("passing through the target at speed counted as arrival")
 	}
@@ -214,5 +220,49 @@ func TestLatestTargetOnAnEmptyChannel(t *testing.T) {
 	d := &Desk{chMove: make(chan int, 1)}
 	if _, ok := latestTarget(d.chMove); ok {
 		t.Error("reported a target where none was pending")
+	}
+}
+
+// The dead band is measured, and the direction of error matters: a
+// tolerance above it silently turns real moves into no-ops, because the
+// loop reports arrival before the desk has started.
+func TestArrivalToleranceMatchesTheMeasuredDeadBand(t *testing.T) {
+	const (
+		largestIgnored = 12 // 1.2mm: the desk does not move
+		smallestMoved  = 13 // 1.3mm: it does
+	)
+
+	if arrivalTolerance < largestIgnored {
+		t.Errorf("arrivalTolerance = %d, below the dead band: a request of %d would wait for movement the desk will not make",
+			arrivalTolerance, largestIgnored)
+	}
+	if arrivalTolerance >= smallestMoved {
+		t.Errorf("arrivalTolerance = %d, at or above the smallest distance the desk moves for (%d): real moves would report arrival before starting",
+			arrivalTolerance, smallestMoved)
+	}
+}
+
+// A consumer republishing a target it already sent is ordinary - a
+// retained message redelivered, a UI echoing its own state. Treating that
+// as a retarget stops a move that is already going where it is asked to,
+// and stopping near the end leaves a remainder inside the dead band, so
+// the restart reports not moving and the desk ends up short.
+func TestSameDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b int
+		same bool
+	}{
+		{"identical", 7350, 7350, true},
+		{"within the dead band", 7350, 7350 + arrivalTolerance, true},
+		{"within the dead band, below", 7350, 7350 - arrivalTolerance, true},
+		{"just past the dead band", 7350, 7350 + arrivalTolerance + 1, false},
+		{"a real move", 7350, 4800, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameDestination(tc.a, tc.b); got != tc.same {
+				t.Errorf("sameDestination(%d, %d) = %v, want %v", tc.a, tc.b, got, tc.same)
+			}
+		})
 	}
 }

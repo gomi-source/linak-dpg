@@ -253,7 +253,9 @@ seconds without progress.
 **A halt is not an arrival, and it is not pushed through.** The desk
 reports speed 0 both when it has reached the target and when it has
 stopped short — and one reason it stops short is that it has hit
-something. Arrival is *speed 0 and within 2 mm of the target*. A halt
+something. Arrival is *speed 0 and within the controller's dead band of
+the target* — 1.2 mm, measured: a DPG1M moves for a 1.3 mm request and
+not for 1.2 mm. A halt
 anywhere else, once the desk has been moving, **ends the move**: the
 target is not written again. The controller's own safety stop is the only
 protection whatever it met has, and re-commanding would drive the desk
@@ -263,6 +265,18 @@ ask again belongs to the caller, who may know the way is clear.
 Before the desk has moved at all, the target is offered for a short grace
 period — it takes a moment to pick the first one up — and then given up on
 with a warning. That window is deliberately brief for the same reason.
+
+**The usual reason a move never starts is that it had nowhere to go.** The
+controller will not act on a target inside its dead band, so `desk did not
+start moving` logs the distance alongside the target: a small one means
+the move was a no-op, not a failure. Ownership is the other explanation,
+and the less likely one wherever `TakeOwnership` runs on each connect.
+
+`arrivalTolerance` is that dead band, and it answers both questions
+because they are the same fact: a target this close is a no-op, and a desk
+stopped this close has arrived, since it cannot get nearer. **Too large is
+the dangerous direction** — set above the dead band, it makes real moves
+report arrival before they start, and then nothing sustains them.
 
 Calling `Move` again while moving retargets rather than starting a second
 move — but a retarget is a new move, not an assignment. **The desk only
@@ -293,6 +307,17 @@ the desk is quiet supersede the one that started the gap, so `1500, 1700,
 runs to 2100 — rather than pausing 800 ms per nudge. The direction check
 is made after the gap against the final target, so a burst that ends up
 pointing the other way is still stopped properly first.
+
+**The same destination again is not a retarget at all.** A consumer
+republishing a value it already sent is ordinary — a retained message
+redelivered, a UI echoing its own state — and acting on it would stop a
+move that is already going where it is asked to. Near the end of a move
+that is actively harmful: the stop leaves a remainder inside the dead
+band, so the restart reports `desk did not start moving` and the desk
+finishes short of a target it would otherwise have reached. A repeat
+within the dead band of the current target is therefore ignored, and a
+burst that happens to end where it began resumes the move rather than
+starting a new one.
 
 Position reports go into a one-slot holder, never a queue. They arrive on
 their own goroutine each, so a blocking handoff leaves a backlog of

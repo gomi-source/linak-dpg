@@ -40,14 +40,25 @@ import (
 // a reading nobody collected is discarded rather than queued.
 
 const (
-	// arrivalTolerance is how close counts as arrived, in tenths of a
-	// millimetre. The desk stops under its own control and does not land
-	// exactly on the requested value.
-	arrivalTolerance = 20
+	// arrivalTolerance is the controller's dead band, in tenths of a
+	// millimetre: the largest distance it will not act on. Measured on a
+	// DPG1M, which moves for a 1.3mm request and not for 1.2mm.
+	//
+	// It settles two questions at once, because they are the same physical
+	// fact. A target this close is a no-op, so asking for one reports
+	// arrival rather than waiting for movement that will never come. And a
+	// desk that has stopped this close has arrived, since it cannot get
+	// nearer than its own dead band.
+	//
+	// Too large is the dangerous direction: a value above the dead band
+	// makes real moves - ones the desk would perform - report arrival
+	// before they start, and nothing then sustains them.
+	arrivalTolerance = 12
 
-	// stallTimeout ends a move that never reports anything at all: the
-	// desk is ignoring the writes, which usually means the owner bit is
-	// not set.
+	// stallTimeout ends a move that never reports anything at all - not a
+	// desk that reports standing still, which is handled where the
+	// readings are classified, but one that has gone silent. A dropped
+	// link and a desk that never had the owner bit look the same here.
 	stallTimeout = 5 * time.Second
 
 	// startGrace is how long the target keeps being written to a desk that
@@ -109,8 +120,14 @@ type reading struct {
 // says so. Deciding whether to ask again belongs to the caller, who may
 // know the way is clear; this package will not do it silently.
 //
-// Every write is ignored unless TakeOwnership has succeeded, which is what
-// a move that never starts usually means.
+// A move to where the desk already is does nothing, and says so rather
+// than waiting: the controller has a dead band and will not start for a
+// target close to its current position. That is the usual reason a move
+// reports not starting - see arrivalTolerance.
+//
+// Every write is also ignored unless TakeOwnership has succeeded, which is
+// the other reason, and the likelier one only if ownership is not being
+// asserted on connect.
 func (d *Desk) Move(mmx10 int) error {
 	if d.moving.Load() {
 		d.newTargetHeigh(mmx10)
@@ -211,14 +228,33 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 				continue
 
 			default:
+				// Two things stop a desk starting, and the distance tells
+				// them apart: a target within the controller's own dead
+				// band is simply ignored, which is the common one now that
+				// ownership is asserted on every connect. The distance is
+				// logged so the reader does not have to subtract.
 				log.Warn("desk did not start moving",
 					"target_tenths_mm", mmx10,
 					"at_tenths_mm", r.extension,
-					"hint", "the desk ignores writes unless TakeOwnership has succeeded, or it is blocked")
+					"distance_tenths_mm", abs(mmx10-r.extension),
+					"hint", "a short distance means the target is inside the desk's dead band and it will not move; otherwise the desk ignores writes unless TakeOwnership has succeeded, or it is blocked")
 			}
 			return
 
 		case newTarget := <-d.chMove:
+			// The same destination again is not a retarget. A consumer
+			// republishing a value it already sent is ordinary - a retained
+			// message redelivered, a UI echoing its own state - and acting
+			// on it would stop a move that is already going where it is
+			// asked to go. Worse, stopping near the end leaves a remainder
+			// inside the dead band, so the restart reports not moving and
+			// the desk ends up short of a target it would have reached.
+			if sameDestination(newTarget, mmx10) {
+				log.Debug("move already heading there, ignoring repeat",
+					"target_tenths_mm", mmx10, "repeat_tenths_mm", newTarget)
+				continue
+			}
+
 			// A retarget is a new move, not an assignment. Writing a
 			// different height too soon after the last one halts the desk,
 			// so stop commanding the old target and wait before starting
@@ -234,6 +270,19 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			if latest, ok := latestTarget(d.chMove); ok {
 				log.Debug("move coalescing", "superseded_tenths_mm", newTarget, "to_tenths_mm", latest)
 				newTarget = latest
+			}
+
+			// The burst may have ended where it began. The desk has been
+			// stopped by the wait regardless, so the move has to be started
+			// again - but it is the same move, not a new one.
+			if sameDestination(newTarget, mmx10) {
+				log.Debug("move resuming after a repeat", "target_tenths_mm", mmx10)
+				movedYet = false
+				if !write() {
+					return
+				}
+				resetTimer(stall, stallTimeout)
+				continue
 			}
 
 			// Decided after the gap, against the final target: the desk has
@@ -256,9 +305,12 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			resetTimer(stall, stallTimeout)
 
 		case <-stall.C:
+			// Silence, not stillness: a desk reporting speed 0 is handled
+			// above. Either the link is gone or the desk never accepted
+			// the subscription.
 			log.Warn("move timed out with no position reports",
 				"target_tenths_mm", mmx10,
-				"hint", "the desk ignores writes unless TakeOwnership has succeeded")
+				"hint", "the desk has stopped reporting; the link may be gone, or the desk ignores writes unless TakeOwnership has succeeded")
 			return
 		}
 	}
@@ -329,6 +381,11 @@ func waitReadyForNewTarget(readings *slot[reading], last reading, haveLast bool,
 		}
 	}
 }
+
+// sameDestination reports whether two targets ask for the same place. The
+// dead band is the measure: the desk cannot tell apart two heights closer
+// than that, so neither should this.
+func sameDestination(a, b int) bool { return abs(a-b) <= arrivalTolerance }
 
 // latestTarget takes the newest target waiting, if any, discarding older
 // ones. newTargetHeigh already replaces rather than queues, so this is at
