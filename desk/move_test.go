@@ -51,6 +51,12 @@ func TestArrivalNeedsPositionNotJustSpeed(t *testing.T) {
 	if !arrived(reading{extension: target + arrivalTolerance, speed: 0}) {
 		t.Error("stopped within tolerance did not count as arrival")
 	}
+	// The tolerance is the dead band, so anything past it is a move the
+	// desk would actually perform. Reporting arrival there would end the
+	// move before it started.
+	if arrived(reading{extension: target + arrivalTolerance + 1, speed: 0}) {
+		t.Error("a distance the desk would move for counted as arrival")
+	}
 	if arrived(reading{extension: target, speed: 12}) {
 		t.Error("passing through the target at speed counted as arrival")
 	}
@@ -214,5 +220,116 @@ func TestLatestTargetOnAnEmptyChannel(t *testing.T) {
 	d := &Desk{chMove: make(chan int, 1)}
 	if _, ok := latestTarget(d.chMove); ok {
 		t.Error("reported a target where none was pending")
+	}
+}
+
+// The dead band is measured, and the direction of error matters: a
+// tolerance above it silently turns real moves into no-ops, because the
+// loop reports arrival before the desk has started.
+func TestArrivalToleranceMatchesTheMeasuredDeadBand(t *testing.T) {
+	const (
+		largestIgnored = 12 // 1.2mm: the desk does not move
+		smallestMoved  = 13 // 1.3mm: it does
+	)
+
+	if arrivalTolerance < largestIgnored {
+		t.Errorf("arrivalTolerance = %d, below the dead band: a request of %d would wait for movement the desk will not make",
+			arrivalTolerance, largestIgnored)
+	}
+	if arrivalTolerance >= smallestMoved {
+		t.Errorf("arrivalTolerance = %d, at or above the smallest distance the desk moves for (%d): real moves would report arrival before starting",
+			arrivalTolerance, smallestMoved)
+	}
+}
+
+// A consumer republishing a target it already sent is ordinary - a
+// retained message redelivered, a UI echoing its own state. Treating that
+// as a retarget stops a move that is already going where it is asked to,
+// and stopping near the end leaves a remainder inside the dead band, so
+// the restart reports not moving and the desk ends up short.
+func TestSameDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b int
+		same bool
+	}{
+		{"identical", 7350, 7350, true},
+		{"within the dead band", 7350, 7350 + arrivalTolerance, true},
+		{"within the dead band, below", 7350, 7350 - arrivalTolerance, true},
+		{"just past the dead band", 7350, 7350 + arrivalTolerance + 1, false},
+		{"a real move", 7350, 4800, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameDestination(tc.a, tc.b); got != tc.same {
+				t.Errorf("sameDestination(%d, %d) = %v, want %v", tc.a, tc.b, got, tc.same)
+			}
+		})
+	}
+}
+
+// The controller refuses a different height until it has been left alone,
+// and that is as true between two Move calls as within one. A move that
+// finishes and is immediately followed by another wrote the new height
+// ~370ms after the old one on a DPG1M, and the desk ignored it entirely -
+// no movement, and no reports, because it reports only while moving.
+func TestWaitBeforeTargetSpansMoves(t *testing.T) {
+	d := &Desk{}
+
+	// Nothing written yet: nothing to wait for.
+	if wait := d.waitBeforeTarget(4586); wait != 0 {
+		t.Errorf("first target waits %v, want none", wait)
+	}
+
+	d.noteTargetWritten(4586)
+
+	// The same height again sustains the move and never waits.
+	if wait := d.waitBeforeTarget(4586); wait != 0 {
+		t.Errorf("repeating a height waits %v, want none", wait)
+	}
+	if wait := d.waitBeforeTarget(4586 + arrivalTolerance); wait != 0 {
+		t.Errorf("a height inside the dead band waits %v, want none", wait)
+	}
+
+	// A different one, straight after, waits out what is left of the gap.
+	wait := d.waitBeforeTarget(4718)
+	if wait <= 0 || wait > RetargetGap {
+		t.Errorf("a new height waits %v, want something up to %v", wait, RetargetGap)
+	}
+}
+
+func TestWaitBeforeTargetExpires(t *testing.T) {
+	d := &Desk{}
+	d.noteTargetWritten(4586)
+
+	d.targetMu.Lock()
+	d.lastTargetAt = time.Now().Add(-2 * RetargetGap)
+	d.targetMu.Unlock()
+
+	if wait := d.waitBeforeTarget(4718); wait != 0 {
+		t.Errorf("waits %v long after the last write, want none", wait)
+	}
+}
+
+// A target the desk is already at is a no-op we can recognise, rather
+// than five seconds of silence and a warning. The desk reports only while
+// it moves, so the position comes from the last time it did.
+func TestLastKnownPositionRecognisesANoOp(t *testing.T) {
+	d := &Desk{}
+
+	if _, ok := d.lastKnownPosition(); ok {
+		t.Error("reported a position before the desk ever did")
+	}
+
+	d.notePosition(4586)
+	at, ok := d.lastKnownPosition()
+	if !ok || at != 4586 {
+		t.Fatalf("last known position = %d/%v, want 4586", at, ok)
+	}
+
+	if !sameDestination(4586, at) {
+		t.Error("the height the desk is at was not recognised as a no-op")
+	}
+	if sameDestination(4718, at) {
+		t.Error("a real move was mistaken for a no-op")
 	}
 }

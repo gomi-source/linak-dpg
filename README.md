@@ -253,16 +253,56 @@ seconds without progress.
 **A halt is not an arrival, and it is not pushed through.** The desk
 reports speed 0 both when it has reached the target and when it has
 stopped short — and one reason it stops short is that it has hit
-something. Arrival is *speed 0 and within 2 mm of the target*. A halt
+something. Arrival is *speed 0 and within the controller's dead band of
+the target* — 1.2 mm, measured: a DPG1M moves for a 1.3 mm request and
+not for 1.2 mm. A halt
 anywhere else, once the desk has been moving, **ends the move**: the
 target is not written again. The controller's own safety stop is the only
 protection whatever it met has, and re-commanding would drive the desk
 back into it. The move logs where it stopped and how far short; whether to
 ask again belongs to the caller, who may know the way is clear.
 
-Before the desk has moved at all, the target is offered for a short grace
-period — it takes a moment to pick the first one up — and then given up on
-with a warning. That window is deliberately brief for the same reason.
+Before the desk has moved at all, the target is offered every 200 ms for
+1.5 s, and then given up on with a warning. That is the one place a
+command is repeated at a desk that is not moving, and it is bounded for
+the reason above.
+
+**Nothing acknowledges a write.** ReferenceInput is
+write-without-response, so a target that never reached the controller
+looks exactly like one it chose to ignore. Once the desk is moving this
+costs nothing — its reports drive the loop and the next one re-sends the
+target anyway — but from rest there are no reports, so a single write that
+went missing would end the move in silence. The retry above is for the
+link, not for the desk's decision: it stops the instant the desk has
+moved, after which a halt is the desk's own and is never re-commanded.
+
+**The desk reports only while it moves.** A stationary one says nothing
+at all — no position, no speed 0, nothing. So silence is the normal state
+between moves, and it is also how a move that never started announces
+itself: there is no reading to classify, so the move ends when the start
+window above closes rather than at a speed 0 reading. The warning carries
+the last height the desk reported, which may be from an earlier move, and
+the distance from it. The five-second stall timeout is left for the other
+case — reports that stop mid-move, which means the link went away.
+
+**A move to where the desk already is returns immediately.** The `Desk`
+follows the height continuously once the first move has run — the recorder
+is registered once and never removed, so it also sees a move made from the
+panel — and a target within the dead band of the last known position is
+recognised as a no-op rather than written and waited on. Without that it
+costs five seconds of silence and a warning for a move that was never
+going to happen.
+
+When a move does time out, the remaining explanations are the dead band
+(with an unknown position, so compare the logged distance) and ownership.
+"A height was written too recently" is not among them: the gap above makes
+that state unreachable.
+
+`arrivalTolerance` is that dead band, and it answers both questions
+because they are the same fact: a target this close is a no-op, and a desk
+stopped this close has arrived, since it cannot get nearer. **Too large is
+the dangerous direction** — set above the dead band, it makes real moves
+report arrival before they start, and then nothing sustains them.
 
 Calling `Move` again while moving retargets rather than starting a second
 move — but a retarget is a new move, not an assignment. **The desk only
@@ -274,6 +314,22 @@ writes is what stops the desk — so a retarget goes quiet, waits for the
 stream to report speed 0, and only then writes the new height. The silence
 is the braking. A reversal additionally sends `Stop`, bringing it to rest
 deliberately rather than by coasting.
+
+Two hypotheses for the intermittent failures were tried on a DPG1M and
+both are dead, which is worth recording so they are not tried again. Moves
+that go nowhere are *not* explained by how soon they follow the previous
+one: a new height ignored 313 ms after the last write was ignored just as
+thoroughly at a full 800 ms, and two retargets with timings matching to
+within 2 ms went opposite ways. Nor are they explained by the controller
+disarming at rest: sending a wake-up before each move did not stop them,
+and repeating an ignored move gets it performed without one. Nothing
+deterministic in the protocol fits — a lost write does, which is what the
+retry above is for.
+
+The time of the last height written is remembered on the `Desk` across
+moves, and `RetargetGap` applies to it — but only for its original
+purpose, a desk that is still travelling. It is not what makes a fresh
+move work.
 
 `RetargetGap` (800 ms) is the floor under that wait, not the wait itself:
 the retarget resumes once the desk is at rest *and* the gap has elapsed,
@@ -293,6 +349,17 @@ the desk is quiet supersede the one that started the gap, so `1500, 1700,
 runs to 2100 — rather than pausing 800 ms per nudge. The direction check
 is made after the gap against the final target, so a burst that ends up
 pointing the other way is still stopped properly first.
+
+**The same destination again is not a retarget at all.** A consumer
+republishing a value it already sent is ordinary — a retained message
+redelivered, a UI echoing its own state — and acting on it would stop a
+move that is already going where it is asked to. Near the end of a move
+that is actively harmful: the stop leaves a remainder inside the dead
+band, so the restart reports `desk did not start moving` and the desk
+finishes short of a target it would otherwise have reached. A repeat
+within the dead band of the current target is therefore ignored, and a
+burst that happens to end where it began resumes the move rather than
+starting a new one.
 
 Position reports go into a one-slot holder, never a queue. They arrive on
 their own goroutine each, so a blocking handoff leaves a backlog of
