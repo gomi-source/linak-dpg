@@ -28,7 +28,7 @@ import (
 // stopped short - and one reason it stops short is that it has hit
 // something. The controller's own safety stop is the only protection a
 // person's hand has here, so a halt that is not an arrival ends the move:
-// the target is never re-commanded to make a stopped desk try again. 
+// the target is never re-commanded to make a stopped desk try again.
 //
 // The desk reports only while it moves. A stationary one says nothing at
 // all, so "no reports" is the normal state between moves and the way a

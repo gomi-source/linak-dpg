@@ -37,10 +37,6 @@ was guessed from one desk's behaviour rather than from documentation.
 go get github.com/gomi-source/linak-dpg
 ```
 
-While the three repos are developed together, `go.mod` resolves
-`corebluetooth-go` through a `replace` directive, so they need to sit
-side by side in the same parent directory.
-
 ## Quick start
 
 ```go
@@ -315,7 +311,7 @@ stream to report speed 0, and only then writes the new height. The silence
 is the braking. A reversal additionally sends `Stop`, bringing it to rest
 deliberately rather than by coasting.
 
-Two hypotheses for the intermittent failures were tried on a DPG1M and
+> Two hypotheses for intermittent failures to move were tried on a DPG1M and
 both are dead, which is worth recording so they are not tried again. Moves
 that go nowhere are *not* explained by how soon they follow the previous
 one: a new height ignored 313 ms after the last write was ignored just as
@@ -324,7 +320,7 @@ within 2 ms went opposite ways. Nor are they explained by the controller
 disarming at rest: sending a wake-up before each move did not stop them,
 and repeating an ignored move gets it performed without one. Nothing
 deterministic in the protocol fits — a lost write does, which is what the
-retry above is for.
+retry above is for, and no intermittent failures have been observed since.
 
 The time of the last height written is remembered on the `Desk` across
 moves, and `RetargetGap` applies to it — but only for its original
@@ -520,9 +516,21 @@ bypasses the subscription machinery entirely — that routes by message type
 and drops short frames, which is the behaviour under investigation — and
 reads notifications straight off the ble client.
 
-```sh
-make -C ../corebluetooth-go helper   # once, if the helper is not built yet
+First, get `corebluetoothd`:
 
+```sh
+brew tap gomi-source/corebluetooth-go
+brew trust gomi-source/corebluetooth-go   # once, Homebrew >= 6.0
+brew install corebluetoothd
+```
+
+(or grab `corebluetoothd.app` from the
+[latest corebluetooth-go release](https://github.com/gomi-source/corebluetooth-go/releases/latest).
+Building it locally as a sibling checkout, `make -C ../corebluetooth-go
+helper`, still works too, and is what you want if you're changing the
+helper itself.)
+
+```sh
 go run ./example/frames -name "DESK 8352"            # reads only, safe
 go run ./example/frames -name "DESK 8352" -writes    # also writes values back unchanged
 go run ./example/frames -name "DESK 8352" -unset-memory 4   # destructive, restores
@@ -532,13 +540,16 @@ go run ./example/frames -name "DESK 8352" -listen 2m  # catch frames the desk se
 go run ./example/frames -name "DESK 8352" -hold 10m  # measure how long the link lasts
 ```
 
-Run it from the repo root: it looks for `corebluetoothd` in the usual
-sibling locations, because `ble.Start`'s own lookup cannot help under
-`go run` — that checks next to the running executable, which is a
-temporary build directory, and then `$PATH`, where an entry has to name
-the directory holding the executable itself
-(`.../corebluetoothd.app/Contents/MacOS`) rather than the `.app` bundle or
-its parent. `-helper` overrides, and wants that same inner path.
+Run it from the repo root. A Homebrew install just works, no extra step:
+its `corebluetoothd` is a real symlink of that exact name on `$PATH`, and
+`ble.Start`'s own lookup finds it there directly. The other two options
+need help under `go run`, since `ble.Start`'s "next to the running
+executable" check can't do anything with a temporary build directory:
+`findHelper` in `example/frames/main.go` also looks in `bin/` (from a
+release zip you've unpacked here) and in the usual sibling-checkout
+locations. `-helper` overrides all of that, and wants the path *inside*
+the bundle (`.../corebluetoothd.app/Contents/MacOS/corebluetoothd`), not
+the bundle itself.
 
 It requests each DeskPanel parameter in turn, then optionally writes back
 exactly what it read (leaving the desk's state unchanged) to provoke
@@ -592,31 +603,6 @@ request.
 ## Known rough edges
 
 This is a prototype, and these are known:
-
-- **The connection drops unpredictably, and nothing has been found that
-  provokes or prevents it entirely.**
-
-  There appear to be two modes. In the bad one the controller drops the
-  link over and over, sometimes for minutes, sometimes for hours; in
-  the ordinary one it behaves like any BLE peripheral, dropping occasionally
-  for no visible reason. A Control wake-up seems to end the bad mode, and
-  the effect persists across later connections rather than being a per-session
-  handshake — which is also why runs before and after one cannot be compared
-  as independent samples. LINAK's own iPhone app sends a wake-up and a stop
-  on startup, which is the strongest evidence there is that this is expected
-  of a client. `Desk.WakeUp` and `Desk.Stop` exist for it, and `mqtt-linak`
-  sends both on every connect.
-
-  Beyond the wake-up, treat the remaining drops as ordinary link loss:
-  CoreBluetooth exposes no control over the connection interval or
-  supervision timeout, so there is nothing to tune on macOS.
-
-  What matters is recovering well. After a drop, CoreBluetooth nils out
-  the peripheral's services, so every subsequent call fails with
-  `service not found ... call peripheral.discoverServices first` — a
-  misleading message for a dropped link, and the reason a drop is easy to
-  misdiagnose. Reconnect, rediscover, re-arm notifications, and the
-  requests succeed again.
 
 - **The notify registry cannot unsubscribe.** `notify.go` only appends.
   Everything above about reusing subscriptions follows from this.

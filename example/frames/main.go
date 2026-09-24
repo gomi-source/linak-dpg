@@ -749,17 +749,25 @@ func readMemoryPositions(probe func(string, []byte), suffix string) {
 	}
 }
 
-// helperCandidates are where corebluetoothd ends up after a `make helper`
-// or `make example` in the sibling checkouts, relative to the directory
-// this is run from (the dpg repo root, for `go run ./example/frames`).
+// helperCandidates covers the ways corebluetoothd ends up on this
+// machine: a Homebrew install (gomi-source/corebluetooth-go tap), a
+// GitHub Release .zip unpacked into this repo's own bin/, or a sibling
+// checkout of corebluetooth-go/mqtt-linak built locally for active
+// co-development. Relative entries are relative to the directory this is
+// run from (the dpg repo root, for `go run ./example/frames`); the two
+// Homebrew prefixes are absolute.
 //
-// ble.Start's own lookup is no help here. It checks next to the running
-// executable, which under `go run` is a temporary build directory, and
-// then $PATH — where an entry has to name the directory holding the
-// executable itself, .../corebluetoothd.app/Contents/MacOS, rather than
-// the .app bundle or the directory containing it.
+// A Homebrew install is actually found by ble.Start's own $PATH lookup
+// without any of this (its bin/corebluetoothd is a real symlink named
+// exactly "corebluetoothd") - it's listed explicitly anyway so findHelper
+// can report which one it picked before ble.Start ever runs. The other
+// two cases genuinely need this list: under `go run`, ble.Start's "next
+// to the running executable" check can't help (that's a temporary build
+// directory), and $PATH won't contain a bare .app bundle either.
 var helperCandidates = []string{
 	"bin/corebluetoothd.app/Contents/MacOS/corebluetoothd",
+	"/opt/homebrew/bin/corebluetoothd", // brew, Apple Silicon prefix
+	"/usr/local/bin/corebluetoothd",    // brew, Intel prefix
 	"../corebluetooth-go/helper/.build/corebluetoothd.app/Contents/MacOS/corebluetoothd",
 	"../corebluetooth-go/bin/corebluetoothd.app/Contents/MacOS/corebluetoothd",
 	"../mqtt-linak/bin/corebluetoothd.app/Contents/MacOS/corebluetoothd",
@@ -782,7 +790,13 @@ func findHelper() string {
 
 func helperHint() string {
 	var b strings.Builder
-	b.WriteString("The corebluetoothd helper was not found. Build it with:\n\n")
+	b.WriteString("The corebluetoothd helper was not found. Get it one of these ways:\n\n")
+	b.WriteString("    brew tap gomi-source/corebluetooth-go\n")
+	b.WriteString("    brew trust gomi-source/corebluetooth-go   # once, Homebrew >= 6.0\n")
+	b.WriteString("    brew install corebluetoothd\n\n")
+	b.WriteString("or download corebluetoothd.app from a release:\n\n")
+	b.WriteString("    https://github.com/gomi-source/corebluetooth-go/releases/latest\n\n")
+	b.WriteString("or, building corebluetooth-go locally as a sibling checkout:\n\n")
 	b.WriteString("    make -C ../corebluetooth-go helper\n\n")
 	b.WriteString("and it will be picked up automatically. Looked in:\n")
 	for _, c := range helperCandidates {
