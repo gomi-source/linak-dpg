@@ -110,16 +110,30 @@ func (g *GATT) GetCharacteristic(device Device, serviceUUID, characteristicUUID 
 	if err != nil {
 		return Characteristic{}, err
 	}
-	if len(chars) == 0 {
+
+	// 4. Cache every characteristic returned, and pick the one asked for by
+	// its UUID.
+	//
+	// The filter narrows what CoreBluetooth discovers, not what comes
+	// back: the helper answers with every characteristic the service has
+	// discovered so far. So once a second characteristic of one service
+	// has been looked up, the first entry is whichever was discovered
+	// first - on the Control service, the error characteristic ahead of
+	// the command one - and taking chars[0] sent Stop and wake-up to the
+	// wrong characteristic, where they did nothing and said nothing.
+	var found Characteristic
+	ok := false
+	for _, c := range chars {
+		char := Characteristic{device: device, serviceUUID: svc.uuid, uuid: strings.ToUpper(c.UUID)}
+		g.addCharacteristicToCache(device.PeripheralID, char)
+		if char.uuid == characteristicUUID {
+			found, ok = char, true
+		}
+	}
+	if !ok {
 		return Characteristic{}, fmt.Errorf("characteristic %v not found", characteristicUUID)
 	}
-
-	// 4. Cache it
-	char := Characteristic{device: device, serviceUUID: svc.uuid, uuid: strings.ToUpper(chars[0].UUID)}
-
-	g.addCharacteristicToCache(device.PeripheralID, char)
-
-	return char, nil
+	return found, nil
 }
 
 // Append a characteristic to the cache (safe because Max ≈ 10)
