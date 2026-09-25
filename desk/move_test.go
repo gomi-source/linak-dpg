@@ -5,32 +5,6 @@ import (
 	"time"
 )
 
-// Only a reversal needs the desk stopped first. Getting this wrong in
-// either direction is expensive: an unnecessary stop makes every retarget
-// jerk, and a missing one leaves the desk halting on its own halfway.
-func TestReverses(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		last    reading
-		target  int
-		reverse bool
-	}{
-		{"further in the same direction, going up", reading{extension: 3000, speed: 40}, 5000, false},
-		{"short of the old target but still ahead", reading{extension: 3000, speed: 40}, 3500, false},
-		{"further in the same direction, going down", reading{extension: 4784, speed: -40}, 1484, false},
-		{"up while travelling down", reading{extension: 3000, speed: -40}, 5000, true},
-		{"down while travelling up", reading{extension: 3000, speed: 40}, 1000, true},
-		{"at rest has nothing to reverse", reading{extension: 3000, speed: 0}, 1000, false},
-		{"already past the new target while going up", reading{extension: 3000, speed: 40}, 2900, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := reverses(tc.last, tc.target); got != tc.reverse {
-				t.Errorf("reverses(%+v, %d) = %v, want %v", tc.last, tc.target, got, tc.reverse)
-			}
-		})
-	}
-}
-
 // A speed 0 reading is only an arrival if the desk is also near the
 // target. Treating any speed 0 as arrival is what made a short first move
 // end the whole sequence: the desk reached 4784, reported 0, and the
@@ -129,7 +103,7 @@ func TestHaltClassification(t *testing.T) {
 		{"blocked after moving", reading{extension: 3000, speed: 0}, true, 0, "stopped short"},
 		{"blocked long after moving", reading{extension: 3000, speed: 0}, true, 10 * time.Second, "stopped short"},
 		{"still picking up the target", reading{extension: 3000, speed: 0}, false, 200 * time.Millisecond, "not started yet"},
-		{"deaf or blocked from the start", reading{extension: 3000, speed: 0}, false, 2 * time.Second, "never started"},
+		{"deaf or blocked from the start", reading{extension: 3000, speed: 0}, false, startGrace + time.Second, "never started"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := classify(tc.r, tc.movedYet, tc.sinceWrite); got != tc.want {

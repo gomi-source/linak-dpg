@@ -19,9 +19,15 @@ import (
 // stops, which is how a retarget brings it to rest - it goes quiet, waits
 // for the stream to report speed 0, and only then writes the new height.
 // Writing one sooner halts the desk instead of redirecting it. That pause
-// belongs to us and is not read as the desk stopping of its own accord. A
-// reversal additionally sends Stop, to bring it to rest deliberately
-// rather than by coasting.
+// belongs to us and is not read as the desk stopping of its own accord.
+//
+// Going quiet is slow braking. A DPG1M carries on at full speed for about
+// 0.85s after the last height and then takes about 0.4s to stop, so a
+// retarget at full speed runs on some 40mm. Stop does not shorten it:
+// measured by example/moves -scenarios stopcoast, a Stop sent at the moment
+// of the reversal left the rest time and the overrun unchanged. Stop
+// evidently applies to Control-driven movement, not to a desk heading for
+// a height, so a reversal is braked exactly like any other retarget.
 //
 // A halt is not an arrival, and it is not a thing to push through. The
 // desk reports speed 0 both when it has reached the target and when it has
@@ -40,11 +46,14 @@ import (
 // chose to ignore. Once the desk is moving this costs nothing: its reports
 // drive the loop, and the next one re-sends the target anyway. From rest
 // there are no reports, so a single write that goes missing would end the
-// move in silence. That is why the target is offered on a timer until the
-// desk either starts moving or the start window runs out - the retry is
-// for the link, not for the desk's decision, and it stops the moment the
-// desk has moved. After that a halt is the desk's own and is never
-// re-commanded.
+// move in silence. That is why the target is offered again, a full
+// RetargetGap after the last write, until the desk either starts moving or
+// the start window runs out. The spacing is the point: the controller
+// ignores a height that arrives too soon after the previous one, and
+// restarts that clock on every write, so a retry any sooner could never
+// succeed - it would only keep the desk deaf. The retry is for the link,
+// not for the desk's decision, and it stops the moment the desk has moved.
+// After that a halt is the desk's own and is never re-commanded.
 //
 // Position reports must never be allowed to queue. They arrive on their
 // own goroutine each, so a blocking handoff would leave a backlog of
@@ -80,43 +89,53 @@ const (
 	// Reaching it ends the move: a desk that has not moved by now is not
 	// going to.
 	//
-	// It is deliberately short. The retry exists because an unacknowledged
-	// write can go missing and a stationary desk reports nothing to notice
-	// it by, not because a desk that has declined to move should be talked
-	// into it - so it covers a few lost writes and no more. Once the desk
-	// has moved, a later halt is never re-commanded at all.
-	startGrace = 1500 * time.Millisecond
+	// Offers are a RetargetGap apart, so this fits the first write and two
+	// more at the default gap. It is deliberately no longer: the retry
+	// exists because an unacknowledged write can go missing and a
+	// stationary desk reports nothing to notice it by, not because a desk
+	// that has declined to move should be talked into it. Once the desk has
+	// moved, a later halt is never re-commanded at all.
+	startGrace = 2500 * time.Millisecond
 
-	// startRetryInterval is how often the target is re-offered within
-	// startGrace. Roughly the rate at which the desk's own reports would
-	// drive the writes once it is moving, which is the cadence the
-	// controller is built around.
-	startRetryInterval = 200 * time.Millisecond
+	// offerCheck is how often the move looks at whether a re-offer is due.
+	// It is only the resolution of that check; the spacing of the offers
+	// themselves is RetargetGap, timed from the last write.
+	offerCheck = 100 * time.Millisecond
 
 	// progressThreshold is how much the height has to change to count as
 	// progress and restart the stall timer, in tenths of a millimetre.
 	progressThreshold = 5
 
-	// stopSettle bounds the wait for the desk to come to rest after a
-	// reversal. Reaching it is not fatal - the retarget proceeds anyway -
-	// so it only stops a reversal hanging forever if the desk goes quiet.
+	// stopSettle bounds the wait for the desk to come to rest during a
+	// retarget. Reaching it is not fatal - the retarget proceeds anyway -
+	// so it only stops a retarget hanging forever if the desk goes quiet.
 	stopSettle = 3 * time.Second
 )
 
-// RetargetGap is the minimum quiet period between the last write of one
-// height and the first write of the next, for a retarget: the controller
-// halts rather than redirects when a different height arrives while it is
-// travelling, so it is left alone until it has stopped.
+// RetargetGap is the silence the controller needs after one height before
+// it will act on the next. Every height Move writes, other than the ones
+// sustaining a move already under way, waits for it: the first of a new
+// move, the first after a retarget, and each re-offer to a desk that has
+// not started.
 //
-// It is not what makes a *new* move work. A DPG1M ignored a new height
-// written 800ms after the previous move finished just as thoroughly as one
-// written 313ms after, and moved for the same height moments later - so
-// the gap is about a desk still travelling, and nothing else.
+// Measured on a DPG1M by example/moves -scenarios threshold, which brings
+// the desk to rest, stays silent for a set time and then writes one height:
+// after 500-700ms it was ignored every time (0 of 6), after 800ms half the
+// time, and after 900ms to 2.5s never (14 of 14). The direction of either
+// move made no difference. The clock appears to run from the last height
+// received, and to restart on every one - a desk sent a height too soon
+// and then offered it again every 200ms stayed deaf for as long as that
+// went on - which is why nothing is re-sent inside the gap either.
+//
+// This used to be 800ms, which put every move that followed another
+// closely on a coin flip: the intermittent failures to move were this.
+// A second leaves room for the jitter of a BLE link at the edge, and costs
+// nothing on a retarget at full speed, which takes longer than that to
+// come to rest anyway.
 //
 // It is a package variable so a different controller can be given a
-// different figure; nothing reads it after a move has begun, so change it
-// at startup.
-var RetargetGap = 800 * time.Millisecond
+// different figure. Change it between moves, not during one.
+var RetargetGap = time.Second
 
 // reading is one ReferenceOutput report: where the desk is and how fast it
 // is going.
@@ -134,9 +153,9 @@ type reading struct {
 // travels. Errors after that are logged, not returned.
 //
 // Calling Move again while a move is running retargets that move rather
-// than starting a second one. A reversal stops the desk first and waits
-// for it to come to rest; a new target in the direction already being
-// travelled is simply written.
+// than starting a second one. Either way round - further on, or back the
+// way it came - the desk is brought to rest first and the new height
+// written after, since that is the only way it will take one.
 //
 // A desk that stops short of the target is left stopped. It stops by
 // itself when it meets resistance, and telling it to try again would
@@ -150,8 +169,14 @@ type reading struct {
 // reports not starting - see arrivalTolerance.
 //
 // Every write is also ignored unless TakeOwnership has succeeded, which is
-// the other reason, and the likelier one only if ownership is not being
+// the second reason, and the likelier one only if ownership is not being
 // asserted on connect.
+//
+// The third is pairing. A desk that is not paired with this Mac drops
+// every height written to it, owner bit or not, and says nothing - the
+// characteristic is write-without-response, so there is no reply for a
+// refusal to travel in. Everything else works unpaired, which is what
+// makes it easy to miss; see the package README.
 func (d *Desk) Move(mmx10 int) error {
 	if d.moving.Load() {
 		d.newTargetHeigh(mmx10)
@@ -211,10 +236,11 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 	stall := time.NewTimer(stallTimeout)
 	defer stall.Stop()
 
-	// The target is offered on this tick until the desk starts moving; see
-	// startGrace. It keeps running afterwards and is ignored, which is
-	// cheaper than stopping and restarting it around every retarget.
-	offer := time.NewTicker(startRetryInterval)
+	// Until the desk starts moving, this tick decides when the target is
+	// offered again - a RetargetGap after the last write; see startGrace.
+	// It keeps running afterwards and is ignored, which is cheaper than
+	// stopping and restarting it around every retarget.
+	offer := time.NewTicker(offerCheck)
 	defer offer.Stop()
 
 	write := func() bool {
@@ -254,7 +280,7 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 		if ok {
 			args = append(args, "at_tenths_mm", at, "distance_tenths_mm", abs(mmx10-at))
 		}
-		args = append(args, "hint", "a short distance means the target is inside the desk's dead band and it will not move; otherwise the desk is blocked, or writes are being ignored because TakeOwnership has not succeeded")
+		args = append(args, "hint", "a short distance means the target is inside the desk's dead band and it will not move; otherwise the desk is blocked, is not paired with this Mac (it drops heights over an unpaired link, without saying so), or is ignoring writes because TakeOwnership has not succeeded")
 		log.Warn("desk did not start moving", args...)
 	}
 
@@ -307,8 +333,9 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 
 			case time.Since(offeredSince) < startGrace:
 				// Not started yet. A desk takes a moment to pick up the
-				// first target; the offer tick keeps putting it in front of
-				// it, so there is nothing to do but wait.
+				// first target, and the offer tick will put it in front
+				// of it again once the gap allows, so there is nothing to
+				// do but wait.
 				continue
 
 			default:
@@ -358,18 +385,11 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 				continue
 			}
 
-			// Decided after the gap, against the final target: the desk has
-			// had no commands for RetargetGap by now, so this asks whether
-			// it is still travelling the wrong way rather than whether it
-			// was when the first of the burst arrived.
-			if haveLast && reverses(last, newTarget) {
-				log.Debug("move reversing", "to_tenths_mm", newTarget, "at_tenths_mm", last.extension)
-				if err := d.Stop(); err != nil {
-					log.Warn("could not stop before reversing", "err", err)
-				}
-				last, haveLast = waitUntilStopped(readings, last), true
-			}
-
+			// A reversal used to send Stop here. It never fired - the wait
+			// above has already brought the desk to rest, and a desk at rest
+			// is not reversing - and measured, it would not have helped:
+			// Stop does not brake a desk heading for a height. See the note
+			// at the top of this file.
 			mmx10 = newTarget
 			if !start() { // the desk has to start again from rest
 				return
@@ -378,14 +398,18 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 		case <-offer.C:
 			// Before the desk has moved, a write that went missing is
 			// indistinguishable from one it ignored, and nothing will
-			// report either. Offer the target again - but only until the
-			// window closes, and never once it has moved.
+			// report either. Offer the target again - but only a full gap
+			// after the last write, only until the window closes, and
+			// never once it has moved.
 			if movedYet {
 				continue
 			}
 			if time.Since(offeredSince) >= startGrace {
 				noStart()
 				return
+			}
+			if time.Since(written) < RetargetGap {
+				continue
 			}
 			if !write() {
 				return
@@ -403,35 +427,6 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			args = append(args, "hint", "the desk reports while it moves and goes quiet when it stops, so reports ending without a speed 0 usually means the connection dropped")
 			log.Warn("move timed out with no position reports", args...)
 			return
-		}
-	}
-}
-
-// reverses reports whether reaching newTarget means travelling the other
-// way from where the desk is heading now. Only a reversal needs the desk
-// stopped first; a new target further along, or short of the old one but
-// still ahead, is just a change of destination.
-func reverses(last reading, newTarget int) bool {
-	if last.speed == 0 {
-		return false // already at rest; nothing to reverse
-	}
-	return sign(newTarget-last.extension) == -sign(last.speed)
-}
-
-// waitUntilStopped consumes readings until the desk reports it has come to
-// rest, or stopSettle passes. Returning the last reading keeps the caller's
-// idea of where the desk is current.
-func waitUntilStopped(readings *slot[reading], last reading) reading {
-	deadline := time.After(stopSettle)
-	for {
-		select {
-		case r := <-readings.ch:
-			if r.speed == 0 {
-				return r
-			}
-			last = r
-		case <-deadline:
-			return last
 		}
 	}
 }

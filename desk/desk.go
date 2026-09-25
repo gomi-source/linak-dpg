@@ -571,6 +571,14 @@ func (d *Desk) WakeUp() error { return d.control(dpg.ControlCommandWakeUp) }
 // Stop halts any movement in progress.
 func (d *Desk) Stop() error { return d.control(dpg.ControlCommandStop) }
 
+// Moving reports whether a move started by Move is still running: from
+// the call that starts it until the move has arrived, stopped short, or
+// given up. It is this package's verdict, not the desk's - a desk moved
+// from its own panel is not "moving" here - and it is what to wait on to
+// know that a move is over, since a speed 0 in the position stream can
+// also be a retarget pausing on the way.
+func (d *Desk) Moving() bool { return d.moving.Load() }
+
 // control writes one command to the Control characteristic. It writes
 // without response: these commands are not answered, and a
 // write-with-response on a characteristic that does not support it would
