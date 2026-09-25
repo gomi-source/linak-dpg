@@ -23,6 +23,18 @@ import (
 // Writing one sooner halts the desk instead of redirecting it. That pause
 // belongs to us and is not read as the desk stopping of its own accord.
 //
+// Every different height halts a travelling desk, whichever way it lies.
+// Measured by example/moves -scenarios extend, which bypasses Move and
+// switches a desk at full speed to a second height: further on or nearer,
+// up or down, it came to rest 8-10mm later every time (8 of 8) and sent
+// 01 00 10, just as a reversal does. There is no redirecting a moving
+// desk. So a target further on in the same direction does not interrupt
+// the move at all: Move keeps the current height in front of the desk,
+// notes the new one as next, and goes on to it after arriving - one stop,
+// at a height the desk was going to stop at anyway, however many further
+// targets arrive on the way. Nearer targets and reversals cannot wait like
+// that, since the desk would carry on past them, so they interrupt.
+//
 // Going quiet is slow braking. A DPG1M carries on at full speed for about
 // 0.85s after the last height and then takes about 0.4s to stop, so a
 // retarget at full speed runs on some 40mm. Stop does not shorten it:
@@ -190,6 +202,22 @@ func faultFrame(frame []byte, expectHalt bool) bool {
 	return true
 }
 
+// extends reports whether a new target lies further on in the direction
+// the desk is travelling towards its current one, so that the move can
+// finish the current leg and carry on rather than stop for it. It needs
+// the desk to be moving: before it has, there is no direction to extend,
+// and a retarget costs nothing because there is no speed to lose.
+func extends(current, newTarget int, last reading, haveLast, movedYet bool) bool {
+	if !movedYet || !haveLast {
+		return false
+	}
+	dir := sign(last.speed)
+	if dir == 0 {
+		dir = sign(current - last.extension)
+	}
+	return dir != 0 && dir*(newTarget-current) > arrivalTolerance
+}
+
 // errorFrames is how many error frames a move holds before dropping more.
 // One is enough to end it; the rest are there so an empty frame arriving
 // on the heels of a real one cannot push it out, as it could from a slot.
@@ -203,10 +231,14 @@ const errorFrames = 8
 // the desk has not started, and keeps it in front of the desk while it
 // travels. Errors after that are logged, not returned.
 //
-// Calling Move again while a move is running retargets that move rather
-// than starting a second one. Either way round - further on, or back the
-// way it came - the desk is brought to rest first and the new height
-// written after, since that is the only way it will take one.
+// Calling Move again while a move is running changes where that move goes
+// rather than starting a second one. A target further on in the direction
+// the desk is already travelling is queued: the desk finishes the current
+// leg, and carries on to the newest queued target from there. Any other
+// target - nearer, or back the way it came - retargets at once: the desk
+// is brought to rest and the new height written after, since a different
+// height reaching a moving desk halts it either way. Asking again for the
+// current target drops anything queued.
 //
 // A desk that stops short of the target is left stopped. It stops by
 // itself when it meets resistance, and telling it to try again would
@@ -296,7 +328,13 @@ func (d *Desk) Move(mmx10 int) error {
 // runMove sustains the move until the desk arrives, stops, or never
 // starts. It writes the target repeatedly *while the desk is moving* -
 // which is what keeps it moving - and stops writing the moment it is not.
-func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-chan []byte, mmx10 int) {
+// heightWriter is the one thing runMove needs of ReferenceInput, so that a
+// test can stand a simulated desk in for it.
+type heightWriter interface {
+	WriteWithoutResponse(data []byte) (int, error)
+}
+
+func (d *Desk) runMove(c heightWriter, readings *slot[reading], errs <-chan []byte, mmx10 int) {
 	log := d.device.Logger()
 
 	var last reading
@@ -304,6 +342,10 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-cha
 	movedYet := false
 	written := time.Now()      // the last write of any height
 	offeredSince := time.Now() // the first write of the current one
+
+	// next is a target further on in the same direction, to go on to once
+	// the desk arrives at the current one; see extends.
+	next, haveNext := 0, false
 
 	stall := time.NewTimer(stallTimeout)
 	defer stall.Stop()
@@ -362,6 +404,9 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-cha
 	// and that is not this package's to interrupt.
 	fault := func(frame []byte, r reading, haveR bool) {
 		args := []any{"target_tenths_mm", mmx10}
+		if haveNext {
+			args = append(args, "dropped_next_tenths_mm", next)
+		}
 		if haveR {
 			args = append(args, "at_tenths_mm", r.extension)
 		}
@@ -428,6 +473,35 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-cha
 
 			// Stopped. Why it stopped decides everything.
 			switch {
+			case abs(r.extension-mmx10) <= arrivalTolerance && haveNext:
+				// Arrived at this leg with a further target waiting. The
+				// desk is at rest, which is the one state it takes a new
+				// height in, so the rest is a retarget like any other -
+				// except that nothing had to be interrupted to get here.
+				log.Debug("move leg finished, carrying on",
+					"at_tenths_mm", r.extension, "to_tenths_mm", next)
+				to := next
+				haveNext = false
+				w := waitReadyForNewTarget(readings, errs, false, last, haveLast, written.Add(RetargetGap))
+				last, haveLast = w.last, w.haveLast
+				if w.faulted {
+					fault(w.frame, last, haveLast)
+					return
+				}
+				if latest, ok := latestTarget(d.chMove); ok {
+					log.Debug("move coalescing", "superseded_tenths_mm", to, "to_tenths_mm", latest)
+					to = latest
+				}
+				if sameDestination(to, r.extension) {
+					log.Debug("move finished", "target_tenths_mm", to, "at_tenths_mm", r.extension)
+					return
+				}
+				mmx10 = to
+				if !start() {
+					return
+				}
+				continue
+
 			case abs(r.extension-mmx10) <= arrivalTolerance:
 				log.Debug("move finished", "target_tenths_mm", mmx10, "at_tenths_mm", r.extension)
 
@@ -435,12 +509,18 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-cha
 				// It was moving and it stopped short. That may be an
 				// obstruction, and the desk's safety stop is what protects
 				// whatever it hit - so the move ends here. Re-commanding
-				// would drive it back into the obstruction.
-				log.Warn("move stopped short of its target; not re-commanding",
+				// would drive it back into the obstruction, and so would
+				// going on to a queued target.
+				args := []any{
 					"target_tenths_mm", mmx10,
 					"at_tenths_mm", r.extension,
-					"short_by_tenths_mm", abs(mmx10-r.extension),
-					"hint", "the desk stops by itself when it meets resistance")
+					"short_by_tenths_mm", abs(mmx10 - r.extension),
+				}
+				if haveNext {
+					args = append(args, "dropped_next_tenths_mm", next)
+				}
+				args = append(args, "hint", "the desk stops by itself when it meets resistance")
+				log.Warn("move stopped short of its target; not re-commanding", args...)
 
 			case time.Since(offeredSince) < startGrace:
 				// Not started yet. A desk takes a moment to pick up the
@@ -462,11 +542,27 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-cha
 			// asked to go. Worse, stopping near the end leaves a remainder
 			// inside the dead band, so the restart reports not moving and
 			// the desk ends up short of a target it would have reached.
+			// Asking for the current target again does cancel a queued
+			// one, though: it is the newest thing the caller has said.
 			if sameDestination(newTarget, mmx10) {
+				if haveNext {
+					log.Debug("move no longer carrying on", "target_tenths_mm", mmx10, "dropped_next_tenths_mm", next)
+					haveNext = false
+					continue
+				}
 				log.Debug("move already heading there, ignoring repeat",
 					"target_tenths_mm", mmx10, "repeat_tenths_mm", newTarget)
 				continue
 			}
+
+			// Further on the way the desk is going: nothing to interrupt.
+			// Keep sustaining this leg and carry on from its end.
+			if extends(mmx10, newTarget, last, haveLast, movedYet) {
+				log.Debug("move extending after this leg", "target_tenths_mm", mmx10, "next_tenths_mm", newTarget)
+				next, haveNext = newTarget, true
+				continue
+			}
+			haveNext = false
 
 			// A retarget is a new move, not an assignment. Writing a
 			// different height too soon after the last one halts the desk,
@@ -552,6 +648,9 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-cha
 			// mid-move: the link is gone, or the desk stopped without
 			// saying so. Either way there is nothing left to sustain.
 			args := []any{"target_tenths_mm", mmx10, "moved", movedYet}
+			if haveNext {
+				args = append(args, "dropped_next_tenths_mm", next)
+			}
 			if at, ok := d.lastKnownPosition(); ok {
 				args = append(args, "last_known_tenths_mm", at, "distance_tenths_mm", abs(mmx10-at))
 			}

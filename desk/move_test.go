@@ -230,6 +230,41 @@ func TestWaitReadyReturnsOnACollision(t *testing.T) {
 	})
 }
 
+// A target further on the way the desk is travelling is queued, not
+// retargeted: every different height halts a moving desk, so interrupting
+// for one costs a stop the desk would otherwise make only at the end of
+// the leg.
+func TestExtends(t *testing.T) {
+	up := reading{extension: 500, speed: 6224}
+	down := reading{extension: 2500, speed: -6224}
+	for _, tc := range []struct {
+		name      string
+		current   int
+		newTarget int
+		last      reading
+		haveLast  bool
+		movedYet  bool
+		want      bool
+	}{
+		{"further up", 1000, 1500, up, true, true, true},
+		{"further down", 2000, 1500, down, true, true, true},
+		{"nearer up", 1000, 800, up, true, true, false},
+		{"back down while going up", 1000, 300, up, true, true, false},
+		{"further up while going down", 2000, 2800, down, true, true, false},
+		{"inside the dead band", 1000, 1000 + arrivalTolerance, up, true, true, false},
+		{"not moved yet", 1000, 1500, up, true, false, false},
+		{"no reading yet", 1000, 1500, reading{}, false, true, false},
+		// Momentarily at speed 0 on the way, the direction still comes
+		// from where the desk is against where it is going.
+		{"speed 0 below the target", 1000, 1500, reading{extension: 900}, true, true, true},
+		{"speed 0 at the target", 1000, 1500, reading{extension: 1000}, true, true, false},
+	} {
+		if got := extends(tc.current, tc.newTarget, tc.last, tc.haveLast, tc.movedYet); got != tc.want {
+			t.Errorf("%s: extends(%d, %d) = %v, want %v", tc.name, tc.current, tc.newTarget, got, tc.want)
+		}
+	}
+}
+
 // A burst of targets must cost one interruption, not one each. Nudging a
 // desk upwards four times in a second is a normal thing for a user to do,
 // and each retarget pauses the desk for RetargetGap - so everything that
