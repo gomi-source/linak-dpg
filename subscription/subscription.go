@@ -9,7 +9,7 @@ import (
 type MessageType uint8
 
 const (
-	MessageTypeWriteResponse            MessageType = 255 // Common to all writable characteristics? Or just DPG?
+	MessageTypeWriteResponse            MessageType = 255 // DeskPanel only: no other characteristic acknowledges writes in this form
 	MessageTypeControlError             MessageType = 254
 	MessageTypeReferenceOutput          MessageType = 1
 	MessageTypeDeskPanelCapabilities    MessageType = dpg.DeskPanelResponseCapabilities
@@ -46,7 +46,14 @@ func New(characteristic dpg.Characteristic) Subscribable {
 	}
 }
 
-// All characteristics, and therefore all implementers of this interface, have the WriteCallback
+// AddWriteCallback reports the two-byte acknowledgement the DeskPanel
+// characteristic sends for each write to it.
+//
+// It is on every Subscription, but only a DeskPanel one ever calls it. No
+// other characteristic acknowledges writes this way: ReferenceInput and
+// Control are write-without-response, and a two-byte frame from any other
+// characteristic - the Control error characteristic's, for one - is that
+// characteristic's own data, not an ack.
 func (s *Subscription) AddWriteCallback(callback func([2]byte)) (RemoveCallback func()) {
 	return s.AddCallback(MessageTypeWriteResponse, func(data []byte) {
 		if len(data) != 2 {
@@ -159,14 +166,27 @@ func (s *Subscription) start() error {
 			case dpg.CharacteristicUUIDReferenceOutput:
 				// ReferenceOutput has only one message type
 				msgType = byte(MessageTypeReferenceOutput)
+			case dpg.CharacteristicUUIDControlError:
+				// The Control service's error characteristic gets the
+				// same treatment as ReferenceOutput - one synthetic
+				// message type, every frame through it - but for a
+				// different reason. There it is known that only one kind
+				// of frame exists; here nothing is known at all, and a
+				// frame dropped or misrouted on a guess is the one thing
+				// that would keep it that way. Nothing is filtered on
+				// length either; see the controlerror package.
+				msgType = byte(MessageTypeControlError)
 			}
 
 			for _, handler := range s.handlersFor(msgType) {
 				go handler(data)
 			}
 
-			// Write responses are common to all characteristics and always length 2
-			if len(data) == 2 {
+			// Write acknowledgements are a DeskPanel form, not a GATT one.
+			// Two bytes means an ack only there; on any other
+			// characteristic it is that characteristic's own frame, and
+			// handing it to write handlers would misreport it.
+			if len(data) == 2 && s.characteristic.UUID() == dpg.CharacteristicUUIDDeskPanel {
 				for _, handler := range s.handlersFor(byte(MessageTypeWriteResponse)) {
 					go handler(data)
 				}
