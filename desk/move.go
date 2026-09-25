@@ -137,6 +137,19 @@ const (
 // different figure. Change it between moves, not during one.
 var RetargetGap = time.Second
 
+// HaltOnRetarget writes the new height the moment a retarget is asked for,
+// instead of going quiet and letting the desk coast to rest.
+//
+// It is an experiment, off by default. Writing a different height to a
+// travelling desk halts it rather than redirecting it - which is why a
+// retarget normally waits - but a halt may be exactly what a retarget
+// wants, if it stops the desk sooner than coasting does: at full speed a
+// coast runs on some 40mm. With it on, the retarget still waits for rest
+// and for RetargetGap, timed from that halting write, before writing the
+// height again to start the new move. example/moves -scenarios stopcoast
+// compares the two.
+var HaltOnRetarget = false
+
 // reading is one ReferenceOutput report: where the desk is and how fast it
 // is going.
 type reading struct {
@@ -363,6 +376,17 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			// the new one. Anything the desk reports in that window - speed
 			// 0 included - is the old move ending, not a fault.
 			log.Debug("move retargeting", "from_tenths_mm", mmx10, "to_tenths_mm", newTarget)
+			if HaltOnRetarget {
+				// The halting write counts as the last write: the wait below
+				// is timed from it, since the controller will ignore the
+				// next height if it comes too soon after any height.
+				if _, err := c.WriteWithoutResponse(target(newTarget)); err != nil {
+					log.Warn("halting write failed", "target_tenths_mm", newTarget, "err", err)
+				} else {
+					written = time.Now()
+					d.noteTargetWritten(newTarget)
+				}
+			}
 			last, haveLast = waitReadyForNewTarget(readings, last, haveLast, written.Add(RetargetGap))
 
 			// A burst of targets costs one gap, not one each: whatever
