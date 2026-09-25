@@ -262,7 +262,7 @@ const errorFrames = 8
 // every height written to it, owner bit or not, and says nothing - the
 // characteristic is write-without-response, so there is no reply for a
 // refusal to travel in. Everything else works unpaired, which is what
-// makes it easy to miss; see the package README.
+// makes it easy to miss; see PAIRING.md.
 func (d *Desk) Move(mmx10 int) error {
 	if d.moving.Load() {
 		d.newTargetHeigh(mmx10)
