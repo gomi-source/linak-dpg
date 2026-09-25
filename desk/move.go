@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/gomi-source/linak-dpg"
+	"github.com/gomi-source/linak-dpg/subscription/controlerror"
+	"github.com/gomi-source/linak-dpg/subscription/referenceoutput"
 )
 
 // Moving a DPG desk is not one write. The controller moves only while it
@@ -12,7 +14,7 @@ import (
 // the desk reports it has arrived. Move itself starts a goroutine and
 // returns; every write happens there.
 //
-// Four things make that harder than it sounds.
+// Five things make that harder than it sounds.
 //
 // The desk only accepts a different height once it has come to rest.
 // Rewriting the same height is what sustains movement; stop writing and it
@@ -35,6 +37,18 @@ import (
 // something. The controller's own safety stop is the only protection a
 // person's hand has here, so a halt that is not an arrival ends the move:
 // the target is never re-commanded to make a stopped desk try again.
+//
+// A collision is not even a halt, at first. Measured by example/moves
+// -scenarios blocked: a DPG1M descending at full speed into an obstruction
+// sent 01 00 3B on the Control error characteristic, reported a stall, and
+// then backed away by itself - 32mm in one run, 40mm in another, taking
+// 1.6-1.8s - with every report flagged as collision recovery. It ignored
+// the heights written to it throughout, but until it came to rest they
+// kept coming,
+// and a height it did accept once the recovery was over would have sent
+// it straight back into what it hit. So an error frame, or a report with
+// the recovery flag, ends the move the moment it arrives: nothing more is
+// written, and the desk is left to finish its recovery by itself.
 //
 // The desk reports only while it moves. A stationary one says nothing at
 // all, so "no reports" is the normal state between moves and the way a
@@ -150,12 +164,36 @@ var RetargetGap = time.Second
 // compares the two.
 var HaltOnRetarget = false
 
-// reading is one ReferenceOutput report: where the desk is and how fast it
-// is going.
+// reading is one ReferenceOutput report: where the desk is, how fast it
+// is going, and whether it is recovering from a collision.
 type reading struct {
-	extension int
-	speed     int
+	extension  int
+	speed      int
+	recovering bool
 }
+
+// faultFrame reports whether a frame from the Control error characteristic
+// ends a move. The empty frame does not: it follows an error by about
+// 0.8s, whatever the desk is doing, and reads as the error clearing -
+// which says nothing about the move. Nor does the code a
+// halting write provokes, when this move made that write on purpose -
+// expectHalt says so. Anything else does, including codes never seen
+// before: when the controller says something has gone wrong and nobody
+// knows what, the safe thing is to stop telling it where to go.
+func faultFrame(frame []byte, expectHalt bool) bool {
+	if controlerror.Cleared(frame) {
+		return false
+	}
+	if code, ok := controlerror.Code(frame); ok && expectHalt && code == controlerror.CodeInterrupted {
+		return false
+	}
+	return true
+}
+
+// errorFrames is how many error frames a move holds before dropping more.
+// One is enough to end it; the rest are there so an empty frame arriving
+// on the heels of a real one cannot push it out, as it could from a slot.
+const errorFrames = 8
 
 // Move sends the desk to an extension, in tenths of a millimetre above its
 // own base - not above the floor; see BaseOffset for the other frame.
@@ -174,7 +212,10 @@ type reading struct {
 // itself when it meets resistance, and telling it to try again would
 // defeat the only protection whatever it met has, so the move ends and
 // says so. Deciding whether to ask again belongs to the caller, who may
-// know the way is clear; this package will not do it silently.
+// know the way is clear; this package will not do it silently. A desk
+// that reports a collision is not even left stopped: it backs away by
+// itself, and the move ends as soon as it says so rather than once it
+// has finished - see ControlErrors.
 //
 // A move to where the desk already is does nothing, and says so rather
 // than waiting: the controller has a dead band and will not start for a
@@ -218,17 +259,35 @@ func (d *Desk) Move(mmx10 int) error {
 	// One slot, not a queue: the loop wants the desk's current state, and
 	// a reading it never collected is of no use to anyone.
 	readings := newSlot[reading]()
-	removeCallback := d.roSub.AddReferenceOutputCallback(func(extension, speed int) {
-		readings.put(reading{extension: extension, speed: speed})
+	removeCallback := d.roSub.AddReadingCallback(func(r referenceoutput.Reading) {
+		readings.put(reading{extension: r.Extension, speed: r.Speed, recovering: r.Recovering()})
 	})
 
 	// The first write happens in the goroutine, not here: the controller
 	// may need to be left alone for the rest of RetargetGap before it will
-	// accept this height, and Move must not block for that.
+	// accept this height, and Move must not block for that. Neither must it
+	// block for the error characteristic, which the first move of all has
+	// to discover and subscribe to.
 	go func() {
 		defer d.moving.Store(false)
 		defer removeCallback()
-		d.runMove(c, readings, mmx10)
+
+		errs := make(chan []byte, errorFrames)
+		if ce, err := d.ControlErrors(); err != nil {
+			// Not fatal: the position reports still carry the collision
+			// flag, and a blocked desk still stops by itself.
+			d.device.Logger().Debug("move is not watching the error characteristic", "err", err)
+		} else {
+			removeErrors := ce.AddControlErrorCallback(func(frame []byte) {
+				select {
+				case errs <- frame:
+				default: // the move has one already, and one is enough
+				}
+			})
+			defer removeErrors()
+		}
+
+		d.runMove(c, readings, errs, mmx10)
 	}()
 
 	return nil
@@ -237,7 +296,7 @@ func (d *Desk) Move(mmx10 int) error {
 // runMove sustains the move until the desk arrives, stops, or never
 // starts. It writes the target repeatedly *while the desk is moving* -
 // which is what keeps it moving - and stops writing the moment it is not.
-func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int) {
+func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], errs <-chan []byte, mmx10 int) {
 	log := d.device.Logger()
 
 	var last reading
@@ -297,6 +356,33 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 		log.Warn("desk did not start moving", args...)
 	}
 
+	// fault ends a move the controller has flagged: an error frame, or a
+	// position report in collision recovery. Nothing is written after it.
+	// The desk carries on with whatever recovery it has started by itself,
+	// and that is not this package's to interrupt.
+	fault := func(frame []byte, r reading, haveR bool) {
+		args := []any{"target_tenths_mm", mmx10}
+		if haveR {
+			args = append(args, "at_tenths_mm", r.extension)
+		}
+		msg := "desk reported a collision; move ended, not re-commanding"
+		if frame != nil {
+			args = append(args, "frame", fmt.Sprintf("% X", frame))
+			if code, ok := controlerror.Code(frame); ok {
+				args = append(args, "code", fmt.Sprintf("0x%02X", code), "meaning", controlerror.Describe(code))
+				if code != controlerror.CodeCollision {
+					msg = "desk reported an error; move ended, not re-commanding"
+				}
+			} else {
+				msg = "desk reported an error; move ended, not re-commanding"
+			}
+		} else {
+			args = append(args, "flag", "collision recovery")
+		}
+		args = append(args, "hint", "after a collision the desk backs away by itself; it ignores heights until it has finished, and a new move before then may not start")
+		log.Warn(msg, args...)
+	}
+
 	// A move that follows another too closely is the same mistake as a
 	// retarget that does: the controller halts rather than redirects. The
 	// previous move may have been this Desk's or somebody else's on the same
@@ -313,11 +399,23 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 
 	for {
 		select {
+		case frame := <-errs:
+			if !faultFrame(frame, false) {
+				continue
+			}
+			fault(frame, last, haveLast)
+			return
+
 		case r := <-readings.ch:
 			if haveLast && abs(r.extension-last.extension) >= progressThreshold {
 				resetTimer(stall, stallTimeout)
 			}
 			last, haveLast = r, true
+
+			if r.recovering {
+				fault(nil, r, true)
+				return
+			}
 
 			if r.speed != 0 {
 				// Moving freely: keep the target in front of it.
@@ -376,6 +474,7 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 			// the new one. Anything the desk reports in that window - speed
 			// 0 included - is the old move ending, not a fault.
 			log.Debug("move retargeting", "from_tenths_mm", mmx10, "to_tenths_mm", newTarget)
+			halting := false
 			if HaltOnRetarget {
 				// The halting write counts as the last write: the wait below
 				// is timed from it, since the controller will ignore the
@@ -385,9 +484,17 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 				} else {
 					written = time.Now()
 					d.noteTargetWritten(newTarget)
+					halting = true
 				}
 			}
-			last, haveLast = waitReadyForNewTarget(readings, last, haveLast, written.Add(RetargetGap))
+			w := waitReadyForNewTarget(readings, errs, halting, last, haveLast, written.Add(RetargetGap))
+			last, haveLast = w.last, w.haveLast
+			if w.faulted {
+				// The desk may have coasted into something - a retarget
+				// at full speed runs on for some 40mm.
+				fault(w.frame, last, haveLast)
+				return
+			}
 
 			// A burst of targets costs one gap, not one each: whatever
 			// arrived while we were quiet supersedes what started it. Only
@@ -455,19 +562,33 @@ func (d *Desk) runMove(c dpg.Characteristic, readings *slot[reading], mmx10 int)
 	}
 }
 
+// waitResult is what waitReadyForNewTarget saw.
+type waitResult struct {
+	last     reading
+	haveLast bool
+
+	// faulted is set when the desk flagged a collision or sent an error
+	// frame while it was coming to rest. frame is that frame, or nil when
+	// it was the recovery flag.
+	faulted bool
+	frame   []byte
+}
+
 // waitReadyForNewTarget writes nothing and waits for the desk to be ready
 // for a different height: at rest, and at least gapUntil. Not writing is
 // what brings it to rest, so this is the stopping as much as the waiting.
 //
-// Readings here are not classified. The desk coming to rest during it is
-// the old move ending - the thing being waited for - rather than a stop
-// worth reporting, and they are consumed only to keep the caller's idea of
-// where the desk is current.
+// Readings here are not classified as arrivals or stops. The desk coming
+// to rest during it is the old move ending - the thing being waited for -
+// rather than a stop worth reporting. Faults are another matter: a desk
+// that coasts into something on the way to rest says so, and that returns
+// at once. halting says the move has just written a halting height, whose
+// own error frame is expected and not a fault; see faultFrame.
 //
 // It gives up after stopSettle so a desk that goes quiet without reporting
 // rest cannot hang the move; the retarget then proceeds anyway, which is
 // no worse than the fixed pause it replaced.
-func waitReadyForNewTarget(readings *slot[reading], last reading, haveLast bool, gapUntil time.Time) (reading, bool) {
+func waitReadyForNewTarget(readings *slot[reading], errs <-chan []byte, halting bool, last reading, haveLast bool, gapUntil time.Time) waitResult {
 	atRest := haveLast && last.speed == 0
 	gapPassed := false
 
@@ -478,16 +599,23 @@ func waitReadyForNewTarget(readings *slot[reading], last reading, haveLast bool,
 
 	for {
 		if atRest && gapPassed {
-			return last, haveLast
+			return waitResult{last: last, haveLast: haveLast}
 		}
 		select {
+		case frame := <-errs:
+			if faultFrame(frame, halting) {
+				return waitResult{last: last, haveLast: haveLast, faulted: true, frame: frame}
+			}
 		case r := <-readings.ch:
 			last, haveLast = r, true
+			if r.recovering {
+				return waitResult{last: last, haveLast: haveLast, faulted: true}
+			}
 			atRest = r.speed == 0
 		case <-gap.C:
 			gapPassed = true
 		case <-deadline.C:
-			return last, haveLast
+			return waitResult{last: last, haveLast: haveLast}
 		}
 	}
 }

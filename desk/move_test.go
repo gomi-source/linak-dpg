@@ -124,7 +124,8 @@ func TestWaitReadyNeedsBothRestAndTheGap(t *testing.T) {
 	// At rest immediately, but the gap has not passed: must still wait.
 	readings.put(reading{extension: 4784, speed: 0})
 	start := time.Now()
-	last, haveLast := waitReadyForNewTarget(readings, moving, true, start.Add(60*time.Millisecond))
+	w := waitReadyForNewTarget(readings, nil, false, moving, true, start.Add(60*time.Millisecond))
+	last, haveLast := w.last, w.haveLast
 
 	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
 		t.Errorf("returned after %v; the minimum gap was not honoured", elapsed)
@@ -146,8 +147,8 @@ func TestWaitReadyKeepsWaitingWhileStillMoving(t *testing.T) {
 	}()
 
 	start := time.Now()
-	last, _ := waitReadyForNewTarget(readings, reading{extension: 4900, speed: -30}, true,
-		start.Add(10*time.Millisecond)) // gap expires almost at once
+	last := waitReadyForNewTarget(readings, nil, false, reading{extension: 4900, speed: -30}, true,
+		start.Add(10*time.Millisecond)).last // gap expires almost at once
 
 	if elapsed := time.Since(start); elapsed < 70*time.Millisecond {
 		t.Errorf("returned after %v, before the desk reported rest", elapsed)
@@ -161,11 +162,72 @@ func TestWaitReadyKeepsWaitingWhileStillMoving(t *testing.T) {
 func TestWaitReadyGivesUpOnSilence(t *testing.T) {
 	readings := newSlot[reading]()
 	start := time.Now()
-	waitReadyForNewTarget(readings, reading{extension: 4900, speed: -30}, true, start)
+	waitReadyForNewTarget(readings, nil, false, reading{extension: 4900, speed: -30}, true, start)
 
 	if elapsed := time.Since(start); elapsed < stopSettle {
 		t.Errorf("returned after %v, want the full stopSettle backstop", elapsed)
 	}
+}
+
+// The frames are the ones a DPG1M sent: 01 00 3B running into an
+// obstruction, 01 00 10 after a halting write, and an empty frame once the
+// desk was at rest after the halt.
+func TestFaultFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		frame      []byte
+		expectHalt bool
+		want       bool
+	}{
+		{"collision", []byte{0x01, 0x00, 0x3B}, false, true},
+		{"collision while halting", []byte{0x01, 0x00, 0x3B}, true, true},
+		{"interrupted, not by us", []byte{0x01, 0x00, 0x10}, false, true},
+		{"interrupted by our own halting write", []byte{0x01, 0x00, 0x10}, true, false},
+		{"cleared", []byte{}, false, false},
+		{"never seen before", []byte{0x01, 0x00, 0x77}, true, true},
+		{"an odd shape", []byte{0x05}, false, true},
+	} {
+		if got := faultFrame(tc.frame, tc.expectHalt); got != tc.want {
+			t.Errorf("%s: faultFrame(% X, %v) = %v, want %v", tc.name, tc.frame, tc.expectHalt, got, tc.want)
+		}
+	}
+}
+
+// A desk that coasts into something while a retarget waits for it to come
+// to rest must end the move there, not have the new height written to it.
+func TestWaitReadyReturnsOnACollision(t *testing.T) {
+	t.Run("error frame", func(t *testing.T) {
+		readings := newSlot[reading]()
+		errs := make(chan []byte, 1)
+		errs <- []byte{0x01, 0x00, 0x3B}
+		start := time.Now()
+		w := waitReadyForNewTarget(readings, errs, false, reading{extension: 1400, speed: -6224}, true, start.Add(time.Second))
+		if !w.faulted || w.frame == nil {
+			t.Fatalf("got %+v, want a fault carrying the frame", w)
+		}
+		if time.Since(start) > 500*time.Millisecond {
+			t.Error("waited out the gap instead of returning on the fault")
+		}
+	})
+	t.Run("recovery flag", func(t *testing.T) {
+		readings := newSlot[reading]()
+		readings.put(reading{extension: 1183, speed: 0, recovering: true})
+		w := waitReadyForNewTarget(readings, nil, false, reading{extension: 1200, speed: -6224}, true, time.Now().Add(time.Second))
+		if !w.faulted || w.frame != nil || w.last.extension != 1183 {
+			t.Fatalf("got %+v, want a flag fault at 1183", w)
+		}
+	})
+	t.Run("our own halt is not one", func(t *testing.T) {
+		readings := newSlot[reading]()
+		errs := make(chan []byte, 2)
+		errs <- []byte{0x01, 0x00, 0x10}
+		errs <- []byte{}
+		readings.put(reading{extension: 1310, speed: 0})
+		w := waitReadyForNewTarget(readings, errs, true, reading{extension: 1300, speed: 6224}, true, time.Now().Add(50*time.Millisecond))
+		if w.faulted {
+			t.Fatalf("the halt's own error frame ended the retarget: %+v", w)
+		}
+	})
 }
 
 // A burst of targets must cost one interruption, not one each. Nudging a

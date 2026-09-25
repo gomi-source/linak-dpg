@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gomi-source/linak-dpg"
+	"github.com/gomi-source/linak-dpg/subscription/controlerror"
 	"github.com/gomi-source/linak-dpg/subscription/deskpanel"
 	"github.com/gomi-source/linak-dpg/subscription/referenceoutput"
 )
@@ -54,6 +55,14 @@ type Desk struct {
 	// changes.
 	reminderMu sync.Mutex
 	slots      *deskPanelSlots
+
+	// ceSub is the Control error characteristic, made on first use and
+	// kept, like the others, for the life of the Desk. A failure to get it
+	// is kept too: the characteristic is either there or it is not, and
+	// asking again on every move could cost each one a discovery timeout.
+	ceOnce sync.Once
+	ceSub  controlerror.Subscribable
+	ceErr  error
 
 	chMove chan int
 	moving atomic.Bool
@@ -149,6 +158,25 @@ func (d *Desk) Positions() referenceoutput.Subscribable {
 // rather than leaving two dispatchers running.
 func (d *Desk) SetPositions(sub *referenceoutput.Subscription) {
 	d.roSub = sub
+}
+
+// ControlErrors is the Control error characteristic, 99FA0003: the frames
+// the controller sends when a move goes wrong - it ran into something, or
+// was halted. Move watches it and ends a move on an error; see move.go.
+//
+// It is made on first use, and there is only ever one per Desk: a
+// subscription's dispatcher can never be removed, so a second one on the
+// same characteristic is a second dispatcher for the life of the client.
+// Callers that want the frames too should add their callbacks here. The error is for a desk or a corebluetoothd helper without the
+// characteristic, which is worth carrying on without.
+func (d *Desk) ControlErrors() (controlerror.Subscribable, error) {
+	d.ceOnce.Do(func() {
+		if d.ceSub != nil {
+			return
+		}
+		d.ceSub, d.ceErr = controlerror.NewSubscription(d.device)
+	})
+	return d.ceSub, d.ceErr
 }
 
 // Device getter
