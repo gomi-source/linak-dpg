@@ -124,7 +124,9 @@ without the read-back it would mean very little, since a rejected write is
 indistinguishable from a successful one.
 
 If moves are being accepted by your code and ignored by the desk, this is
-almost always why.
+one of two reasons. The other is pairing: a desk that is not paired with
+this Mac ignores heights just as silently, owner bit or not — see *Found
+is not free* below.
 
 ## Finding a desk
 
@@ -137,6 +139,65 @@ advertised name or by its CoreBluetooth peripheral ID.
 
 Note that a peripheral ID is stable across reconnects on one Mac but
 differs between Macs for the same physical desk.
+
+### Found is not free: pairing
+
+Shortly after a connection is made, macOS shows a **Connection Request**
+dialog for the desk: *Connect* or *Cancel*. It is pairing, and it is
+macOS asking, not this package — CoreBluetooth has no option that stops
+it.
+
+**Moving needs it.** On a desk that is not paired with this Mac,
+everything short of a move works: `TakeOwnership` reads back the owner
+bit it wrote, so DeskPanel writes are accepted, and wake-up and stop raise
+no error. But heights written to ReferenceInput are dropped, and the desk
+does not move. It says nothing about it, because it cannot:
+ReferenceInput is write-without-response, so there is no reply for a
+refusal to travel in. Presumably the controller acts on a height only
+over an encrypted link. The result looks exactly like missing ownership
+— see *Ownership* above — and is told apart by the dialog, or by the desk
+missing from this Mac's known devices.
+
+What the dialog's three outcomes leave:
+
+- ***Connect*** pairs the desk, and moves work.
+- ***Cancel*** leaves it unpaired: reads, ownership and Control commands
+  work, moves do not, and the dialog comes back on the next connect. (The
+  "ignore this device" checkbox behaves like *Cancel*.)
+- **Left unanswered**, the dialog withdraws itself after a while,
+  whatever the program does in the meantime. Until then requests stall,
+  and since the dialog outlasts this package's own request timeout, one
+  caught behind it fails first — `context deadline exceeded` from
+  `GetCharacteristic`. The next connect succeeds, but the desk is still
+  unpaired, so moves still do nothing.
+
+**A desk connected to another Mac looks available and is not.** It goes
+on advertising, so it shows up in a scan, in `mqtt-linak -scan`, in
+Bluetility — and every connect attempt simply times out:
+
+```
+connect: corebluetoothd: rpc error 2: timeout: connect timed out
+```
+
+CoreBluetooth reports neither success nor failure because the desk never
+answers, which is why every tool on the Mac trying to connect fails the
+same way and none of them says why.
+
+Pairing is not what holds a desk. A desk has been paired with two Macs
+at once and moved for whichever was connected, and on a paired Mac it
+shows as *not connected* in System Settings once the program has
+disconnected. What holds it is a live connection — and that need not be
+visible: once, a Mac kept the desks connected after its bridge had been
+stopped, and went on reconnecting them, when it never had before; what
+did it was not established. So when a desk can be seen but not connected
+to, look for another Mac connected to it, check there for anything still
+running (`pgrep -fl 'corebluetoothd|mqtt-linak'`, and a launchd job that
+restarts what was stopped), and failing that, forget the desk there
+(System Settings → Bluetooth → ⓘ → Forget This Device) or turn that Mac's
+Bluetooth off — either releases it at once. Forgetting it on the Mac that
+cannot connect does nothing, and neither does restarting `bluetoothd`
+there. A dialog waiting on this Mac fails differently: the connect
+succeeds and a later request times out.
 
 ## Packages
 
@@ -290,7 +351,8 @@ costs five seconds of silence and a warning for a move that was never
 going to happen.
 
 When a move does time out, the remaining explanations are the dead band
-(with an unknown position, so compare the logged distance) and ownership.
+(with an unknown position, so compare the logged distance), ownership, and
+pairing.
 "A height was written too recently" is not among them: the gap above makes
 that state unreachable.
 
