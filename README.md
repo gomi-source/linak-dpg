@@ -617,3 +617,10 @@ DPG1M.
 - [`mqtt-linak`](https://github.com/gomi-source/mqtt-linak) — an MQTT
   bridge built on this, and a worked example of the reconnect and
   ownership handling described above
+
+## Credits
+
+Based on work from:
+- https://github.com/rhyst/linak-controller
+- https://github.com/jechtom/linak-desk-client
+- https://github.com/anson-vandoren/linak-desk-spec
