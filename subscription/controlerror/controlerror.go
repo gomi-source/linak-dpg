@@ -39,6 +39,13 @@ const (
 	// CodeCollision came as the desk ran into an obstruction, just before
 	// its reports showed it stalling and then backing away.
 	CodeCollision byte = 0x3B
+
+	// CodeNeedsReset answered the first height written to a desk whose
+	// controller had dropped into its re-initialisation state: its own
+	// panel would only move it down, and slowly, until it was reset
+	// (lowest position, hold down). It came 0.2s after the write, the desk
+	// did not move, and an empty frame followed 0.66s later. Seen once.
+	CodeNeedsReset byte = 0x1D
 )
 
 // Code returns the code byte of a 01 00 <code> frame. It returns false for
@@ -61,6 +68,8 @@ func Describe(code byte) string {
 		return "interrupted: a new height reached the desk while it was moving"
 	case CodeCollision:
 		return "collision: the desk ran into something"
+	case CodeNeedsReset:
+		return "needs reset: the controller wants re-initialisation before it will move to a height"
 	default:
 		return fmt.Sprintf("code 0x%02X, not seen before", code)
 	}

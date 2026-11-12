@@ -370,6 +370,7 @@ have been `01 00` every time. Seen on a DPG1M:
 | Frame | When |
 |---|---|
 | `01 00 3B` | the desk ran into an obstruction (`CodeCollision`) |
+| `01 00 1D` | a height was written to a desk whose controller had dropped into its re-initialisation state, the one where the panel moves it only down, slowly (`CodeNeedsReset`) |
 | `01 00 10` | a different height reached a travelling desk and halted it (`CodeInterrupted`) |
 | empty | about 0.8 s after the error frame; taken as the error clearing |
 

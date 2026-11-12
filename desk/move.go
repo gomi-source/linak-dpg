@@ -410,21 +410,31 @@ func (d *Desk) runMove(c heightWriter, readings *slot[reading], errs <-chan []by
 		if haveR {
 			args = append(args, "at_tenths_mm", r.extension)
 		}
-		msg := "desk reported a collision; move ended, not re-commanding"
+		// A collision is the one fault whose aftermath is known: the desk
+		// backs away by itself. Any other code gets a hint that claims no
+		// more than is known - the hint used to describe a collision
+		// whatever the code, which sent a reader looking for an
+		// obstruction behind a refusal like 0x1D.
+		collision := frame == nil
 		if frame != nil {
 			args = append(args, "frame", fmt.Sprintf("% X", frame))
 			if code, ok := controlerror.Code(frame); ok {
 				args = append(args, "code", fmt.Sprintf("0x%02X", code), "meaning", controlerror.Describe(code))
-				if code != controlerror.CodeCollision {
-					msg = "desk reported an error; move ended, not re-commanding"
-				}
-			} else {
-				msg = "desk reported an error; move ended, not re-commanding"
+				collision = code == controlerror.CodeCollision
 			}
 		} else {
 			args = append(args, "flag", "collision recovery")
 		}
-		args = append(args, "hint", "after a collision the desk backs away by itself; it ignores heights until it has finished, and a new move before then may not start")
+		msg := "desk reported an error; move ended, not re-commanding"
+		hint := "the controller reported a fault and the move was not retried; if the desk's own panel cannot move it normally either, the controller may need its reset (bottom position, hold down)"
+		if code, ok := controlerror.Code(frame); ok && code == controlerror.CodeNeedsReset {
+			hint = "the controller needs re-initialisation and will not move to a height until it has had it: run the desk to its lowest position with the panel and hold down until it finishes its reset"
+		}
+		if collision {
+			msg = "desk reported a collision; move ended, not re-commanding"
+			hint = "after a collision the desk backs away by itself; it ignores heights until it has finished, and a new move before then may not start"
+		}
+		args = append(args, "hint", hint)
 		log.Warn(msg, args...)
 	}
 
